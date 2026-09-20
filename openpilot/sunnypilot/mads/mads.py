@@ -183,7 +183,9 @@ class ModularAssistiveDrivingSystem:
     if not CS.cruiseState.available and not self.no_main_cruise:
       self.events.remove(EventName.buttonEnable)
       if self.selfdrive.CS_prev.cruiseState.available:
-        self.events_sp.add(EventNameSP.lkasDisable)
+        # ACC MAIN going off ends lateral too, but lkasDisable is an EngagementAlert with no text,
+        # so the driver gets an unexplained chime. Say what happened when lateral was actually on.
+        self.events_sp.add(EventNameSP.manualSteeringRequired if self.enabled else EventNameSP.lkasDisable)
 
     if self.steering_mode_on_brake == MadsSteeringModeOnBrake.DISENGAGE:
       if self.pedal_pressed_non_gas_pressed(CS):
