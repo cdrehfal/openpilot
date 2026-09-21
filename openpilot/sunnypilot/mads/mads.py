@@ -5,6 +5,8 @@ This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
 
+import time
+
 from openpilot.cereal import log, custom
 
 from opendbc.car import structs
@@ -22,6 +24,10 @@ SafetyModel = structs.CarParams.SafetyModel
 
 SET_SPEED_BUTTONS = (ButtonType.accelCruise, ButtonType.resumeCruise, ButtonType.decelCruise, ButtonType.setCruise)
 IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput)
+
+# Holding the LKA button this long toggles lane changes instead of lane centering.
+LKAS_LONG_PRESS_TIME = 1.0  # seconds
+AUTO_LANE_CHANGE_OFF = -1
 
 
 class ModularAssistiveDrivingSystem:
@@ -56,6 +62,10 @@ class ModularAssistiveDrivingSystem:
     self.main_enabled_toggle = self.params.get_bool("MadsMainCruiseAllowed")
     self.steering_mode_on_brake = read_steering_mode_param(self.CP, self.CP_SP, self.params)
     self.unified_engagement_mode = self.params.get_bool("MadsUnifiedEngagementMode")
+
+    # LKA button: short press (acted on at release) toggles lane centering, long press toggles lane changes
+    self.lkas_press_time: float | None = None
+    self.lkas_long_press_handled = False
 
   def read_params(self):
     self.main_enabled_toggle = self.params.get_bool("MadsMainCruiseAllowed")
@@ -96,6 +106,27 @@ class ModularAssistiveDrivingSystem:
         self.replace_event(EventName.wrongCarMode, EventNameSP.wrongCarModeAlertOnly)
     else:
       self.events.remove(EventName.wrongCarMode)
+
+  def toggle_lateral(self):
+    if self.enabled:
+      if self.selfdrive.enabled:
+        self.events_sp.add(EventNameSP.manualSteeringRequired)
+      else:
+        self.events_sp.add(EventNameSP.lkasDisable)
+    else:
+      self.events_sp.add(EventNameSP.lkasEnable)
+
+  def toggle_lane_change(self):
+    # AutoLaneChangeTimer: -1 off, 0 nudge, 1+ nudgeless/timed. Remember the mode to go back to.
+    current = self.params.get("AutoLaneChangeTimer", return_default=True)
+    if current == AUTO_LANE_CHANGE_OFF:
+      restore = self.params.get("AutoLaneChangeTimerSaved", return_default=True)
+      self.params.put_nonblocking("AutoLaneChangeTimer", restore if restore != AUTO_LANE_CHANGE_OFF else 0)
+      self.events_sp.add(EventNameSP.laneChangeOn)
+    else:
+      self.params.put_nonblocking("AutoLaneChangeTimerSaved", current)
+      self.params.put_nonblocking("AutoLaneChangeTimer", AUTO_LANE_CHANGE_OFF)
+      self.events_sp.add(EventNameSP.laneChangeOff)
 
   def transition_paused_state(self):
     if self.state_machine.state != State.paused:
@@ -171,14 +202,20 @@ class ModularAssistiveDrivingSystem:
       if be.type == ButtonType.cancel:
         if not self.selfdrive.enabled and self.selfdrive.enabled_prev:
           self.events_sp.add(EventNameSP.manualLongitudinalRequired)
-      if be.type == ButtonType.lkas and be.pressed and (CS.cruiseState.available or self.allow_always):
-        if self.enabled:
-          if self.selfdrive.enabled:
-            self.events_sp.add(EventNameSP.manualSteeringRequired)
-          else:
-            self.events_sp.add(EventNameSP.lkasDisable)
-        else:
-          self.events_sp.add(EventNameSP.lkasEnable)
+      if be.type == ButtonType.lkas:
+        if be.pressed:
+          self.lkas_press_time = time.monotonic()
+          self.lkas_long_press_handled = False
+        elif self.lkas_press_time is not None:
+          self.lkas_press_time = None
+          if not self.lkas_long_press_handled and (CS.cruiseState.available or self.allow_always):
+            self.toggle_lateral()
+
+    # long press: toggle lane changes as soon as the hold time is reached, so the alert confirms it before release
+    if self.lkas_press_time is not None and not self.lkas_long_press_handled and \
+       time.monotonic() - self.lkas_press_time >= LKAS_LONG_PRESS_TIME:
+      self.lkas_long_press_handled = True
+      self.toggle_lane_change()
 
     if not CS.cruiseState.available and not self.no_main_cruise:
       self.events.remove(EventName.buttonEnable)

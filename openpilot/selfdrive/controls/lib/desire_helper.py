@@ -8,7 +8,8 @@ LaneChangeState = log.LaneChangeState
 LaneChangeDirection = log.LaneChangeDirection
 TurnDirection = custom.ModelDataV2SP.TurnDirection
 
-LANE_CHANGE_SPEED_MIN = 20 * CV.MPH_TO_MS
+# No lane changes below 50 mph: under that a blinker is a turn, not a lane change
+LANE_CHANGE_SPEED_MIN = 50 * CV.MPH_TO_MS
 LANE_CHANGE_TIME_MAX = 10.
 LANE_CHANGE_START_TIME = 0.5
 

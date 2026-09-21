@@ -253,6 +253,22 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 0.1),
   },
 
+  EventNameSP.laneChangeOff: {
+    ET.PERMANENT: Alert(
+      "Lane Changes Off",
+      "Hold the LKA button again to turn them back on",
+      AlertStatus.normal, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 2.5),
+  },
+
+  EventNameSP.laneChangeOn: {
+    ET.PERMANENT: Alert(
+      "Lane Changes On",
+      "",
+      AlertStatus.normal, AlertSize.small,
+      Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 2.5),
+  },
+
   EventNameSP.bigModelReady: {
     ET.PERMANENT: Alert(
       "Big Model Ready",
