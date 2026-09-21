@@ -26,6 +26,9 @@ class ControlsExt(ModelStateBase):
     self.params = params
     self._param_update_time: float = 0.0
     self.blinker_pause_lateral = BlinkerPauseLateral()
+    # lane change mode, passed to the car so its dash lane-change icon can follow it (-1 = off)
+    self.auto_lane_change_timer = int(self.params.get("AutoLaneChangeTimer", return_default=True))
+    self._alc_update_time: float = 0.0
 
     cloudlog.info("controlsd_ext is waiting for CarParamsSP")
     self.CP_SP = messaging.log_from_bytes(params.get("CarParamsSP", block=True), custom.CarParamsSP)
@@ -55,6 +58,11 @@ class ControlsExt(ModelStateBase):
         self.lat_delay = get_lat_delay(self.params, sm["lateralDelay"].lateralDelay)
 
       self._param_update_time = time.monotonic()
+
+    # read more often than the other params: it follows the long-press LKA toggle, so the dash should keep up
+    if time.monotonic() - self._alc_update_time > 0.5:
+      self.auto_lane_change_timer = int(self.params.get("AutoLaneChangeTimer", return_default=True))
+      self._alc_update_time = time.monotonic()
 
   def get_lat_active(self, sm: messaging.SubMaster) -> bool:
     if self.blinker_pause_lateral.update(sm['carState']):
@@ -103,6 +111,12 @@ class ControlsExt(ModelStateBase):
     CC_SP.intelligentCruiseButtonManagement.state = icbm_src.state
     CC_SP.intelligentCruiseButtonManagement.sendButton = icbm_src.sendButton
     CC_SP.intelligentCruiseButtonManagement.vTarget = icbm_src.vTarget
+
+    # params the car interface can use
+    CC_SP.init('params', 1)
+    CC_SP.params[0].key = "AutoLaneChangeTimer"
+    CC_SP.params[0].type = 'int'
+    CC_SP.params[0].value = str(self.auto_lane_change_timer).encode()
 
     return CC_SP
 
