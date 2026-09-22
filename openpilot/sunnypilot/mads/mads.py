@@ -121,11 +121,11 @@ class ModularAssistiveDrivingSystem:
     current = self.params.get("AutoLaneChangeTimer", return_default=True)
     if current == AUTO_LANE_CHANGE_OFF:
       restore = self.params.get("AutoLaneChangeTimerSaved", return_default=True)
-      self.params.put_nonblocking("AutoLaneChangeTimer", restore if restore != AUTO_LANE_CHANGE_OFF else 0)
+      self.params.put("AutoLaneChangeTimer", restore if restore != AUTO_LANE_CHANGE_OFF else 0)
       self.events_sp.add(EventNameSP.laneChangeOn)
     else:
-      self.params.put_nonblocking("AutoLaneChangeTimerSaved", current)
-      self.params.put_nonblocking("AutoLaneChangeTimer", AUTO_LANE_CHANGE_OFF)
+      self.params.put("AutoLaneChangeTimerSaved", current)
+      self.params.put("AutoLaneChangeTimer", AUTO_LANE_CHANGE_OFF)
       self.events_sp.add(EventNameSP.laneChangeOff)
 
   def transition_paused_state(self):
