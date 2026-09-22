@@ -186,6 +186,11 @@ class ModularAssistiveDrivingSystem:
     # wrongCarMode alert only or actively block control
     self.get_wrong_car_mode(selfdrive_enable_events or set_speed_btns_enable)
 
+    # "Toggle with Main Cruise": ACC MAIN going on engages lateral. On cars whose cruise engages in the same
+    # frame MAIN goes on (Ioniq 5 PE: available and enabled rise together), pcmEnable is present on that frame;
+    # with UEM off that event is dropped below, and the main-cruise engage must still happen.
+    main_cruise_rising = self.main_enabled_toggle and CS.cruiseState.available and not self.selfdrive.CS_prev.cruiseState.available
+
     if selfdrive_enable_events:
       if self.pedal_pressed_non_gas_pressed(CS):
         self.events_sp.add(EventNameSP.pedalPressedAlertOnly)
@@ -193,10 +198,11 @@ class ModularAssistiveDrivingSystem:
       if self.block_unified_engagement_mode():
         self.events.remove(EventName.pcmEnable)
         self.events.remove(EventName.buttonEnable)
-    else:
-      if self.main_enabled_toggle:
-        if CS.cruiseState.available and not self.selfdrive.CS_prev.cruiseState.available:
+        if main_cruise_rising:
           self.events_sp.add(EventNameSP.lkasEnable)
+    else:
+      if main_cruise_rising:
+        self.events_sp.add(EventNameSP.lkasEnable)
 
     for be in CS.buttonEvents:
       if be.type == ButtonType.cancel:
