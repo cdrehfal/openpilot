@@ -20,6 +20,14 @@ SpeedLimitSource = custom.LongitudinalPlanSP.SpeedLimit.Source
 
 ALL_SOURCES = tuple(SpeedLimitSource.schema.enumerants.values())
 
+# Fork: ease off ahead of a lower limit the map knows about. The car's camera reports a new limit only at the
+# sign; map data can see it coming. Map data is used for this and nothing else: only to lower the target, only
+# when the map agrees with the sign the camera has already read (so a wrong map entry can't act), and along a
+# gentle ramp that ends at the sign. The camera's reading always wins once it arrives.
+ANTICIPATE_DECEL = 0.5      # m/s^2, ramp gentleness (55 -> 35 mph starts about 360 m before the sign)
+ANTICIPATE_AGREE_TOL = 1.0  # m/s, map current limit must match the car's reading within this (~2 mph)
+ANTICIPATE_MAX_DIST = 600.  # m, ignore map limits further ahead than this
+
 
 class SpeedLimitResolver:
   limit_solutions: dict[custom.LongitudinalPlanSP.SpeedLimit.Source, float]
@@ -176,7 +184,36 @@ class SpeedLimitResolver:
     speed_limit = self.limit_solutions[source] if source else 0.
     distance = self.distance_solutions[source] if source else 0.
 
+    if source == SpeedLimitSource.car:
+      anticipated, dist_ahead = self._anticipate_lower_limit_ahead(sm, speed_limit)
+      if 0. < anticipated < speed_limit:
+        speed_limit, distance, source = anticipated, dist_ahead, SpeedLimitSource.map
+
     return speed_limit, distance, source
+
+  def _anticipate_lower_limit_ahead(self, sm: messaging.SubMaster, car_limit: float) -> tuple[float, float]:
+    """A gently ramped target toward a lower limit the map says is ahead, or (0, 0) when not applicable."""
+    gps_data = sm[self._gps_location_service]
+    map_data = sm['liveMapDataSP']
+    if car_limit <= 0. or not map_data.speedLimitValid or not map_data.speedLimitAheadValid:
+      return 0., 0.
+    if time.monotonic() - gps_data.unixTimestampMillis * 1e-3 > LIMIT_MAX_MAP_DATA_AGE:
+      return 0., 0.
+    # the map must agree with the sign the camera already read, and the limit ahead must be lower
+    if abs(map_data.speedLimit - car_limit) > ANTICIPATE_AGREE_TOL:
+      return 0., 0.
+    next_limit = map_data.speedLimitAhead
+    if not 0. < next_limit < car_limit:
+      return 0., 0.
+
+    distance_since_fix = self.v_ego * (time.monotonic() - gps_data.unixTimestampMillis * 1e-3)
+    dist_ahead = max(0., map_data.speedLimitAheadDistance - distance_since_fix)
+    if dist_ahead > ANTICIPATE_MAX_DIST:
+      return 0., 0.
+
+    # speed that reaches next_limit exactly at the sign with a constant, gentle deceleration
+    ramp = (next_limit ** 2 + 2. * ANTICIPATE_DECEL * dist_ahead) ** 0.5
+    return min(ramp, car_limit), dist_ahead
 
   def update(self, v_ego: float, sm: messaging.SubMaster) -> None:
     self.v_ego = v_ego
