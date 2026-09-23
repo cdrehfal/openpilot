@@ -193,11 +193,14 @@ class SpeedLimitResolver:
 
   def _anticipate_lower_limit_ahead(self, sm: messaging.SubMaster, car_limit: float) -> tuple[float, float]:
     """A gently ramped target toward a lower limit the map says is ahead, or (0, 0) when not applicable."""
-    gps_data = sm[self._gps_location_service]
     map_data = sm['liveMapDataSP']
     if car_limit <= 0. or not map_data.speedLimitValid or not map_data.speedLimitAheadValid:
       return 0., 0.
-    if time.monotonic() - gps_data.unixTimestampMillis * 1e-3 > LIMIT_MAX_MAP_DATA_AGE:
+    # Age of the GPS fix, from the message's receive time. (The receiver's unixTimestampMillis is wall-clock
+    # time; measured against time.monotonic(), seconds since boot, the fix looked ~50 years old and the sign
+    # ~10^10 m away, so this never fired on the device.)
+    gps_fix_age = time.monotonic() - sm.logMonoTime[self._gps_location_service] * 1e-9
+    if not 0. <= gps_fix_age <= LIMIT_MAX_MAP_DATA_AGE:
       return 0., 0.
     # the map must agree with the sign the camera already read, and the limit ahead must be lower
     if abs(map_data.speedLimit - car_limit) > ANTICIPATE_AGREE_TOL:
@@ -206,8 +209,7 @@ class SpeedLimitResolver:
     if not 0. < next_limit < car_limit:
       return 0., 0.
 
-    distance_since_fix = self.v_ego * (time.monotonic() - gps_data.unixTimestampMillis * 1e-3)
-    dist_ahead = max(0., map_data.speedLimitAheadDistance - distance_since_fix)
+    dist_ahead = max(0., map_data.speedLimitAheadDistance - self.v_ego * gps_fix_age)
     if dist_ahead > ANTICIPATE_MAX_DIST:
       return 0., 0.
 

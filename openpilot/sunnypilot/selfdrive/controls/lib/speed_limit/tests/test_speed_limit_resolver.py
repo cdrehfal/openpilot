@@ -145,3 +145,65 @@ class TestSpeedLimitResolverValidation(OpenpilotTestCase):
     resolver._get_from_map_data(sm_mock)
     assert resolver.limit_solutions[SpeedLimitSource.map] == 0.
     assert resolver.distance_solutions[SpeedLimitSource.map] == 0.
+
+
+class TestAnticipateLowerLimitAhead(OpenpilotTestCase):
+  """Fork: ease off toward a lower limit the map says is ahead, keyed on the message receive time (not the
+  receiver's wall-clock timestamp, which is what the device logs and what stopped this from ever firing)."""
+
+  def _sm(self, mocker, car_limit, map_limit, ahead, dist, fix_age=0.05):
+    sm = mocker.MagicMock()
+    sm.__getitem__.side_effect = lambda key: {
+      'carState': create_mock({'gasPressed': False, 'brakePressed': False, 'standstill': False}, mocker),
+      'carStateSP': create_mock({'speedLimit': car_limit}, mocker),
+      'liveMapDataSP': create_mock({'speedLimit': map_limit, 'speedLimitValid': map_limit > 0,
+                                    'speedLimitAhead': ahead, 'speedLimitAheadValid': ahead > 0,
+                                    'speedLimitAheadDistance': dist}, mocker),
+      # what the device logs: wall-clock milliseconds, ~1.7e12
+      'gpsLocation': create_mock({'unixTimestampMillis': time.time() * 1e3}, mocker),
+      'gpsLocationExternal': create_mock({'unixTimestampMillis': time.time() * 1e3}, mocker),
+    }[key]
+    mono = (time.monotonic() - fix_age) * 1e9
+    sm.logMonoTime = {'gpsLocation': mono, 'gpsLocationExternal': mono}
+    return sm
+
+  def _resolver(self):
+    resolver = SpeedLimitResolver()
+    resolver.policy = Policy.car_state_only
+    return resolver
+
+  def test_ramps_toward_lower_limit_ahead(self, mocker):
+    # 55 mph, map agrees, 40 mph in 167 m: aim for ~49 mph now, sourced to the map
+    resolver = self._resolver()
+    resolver.update(24.6, self._sm(mocker, 24.6, 24.6, 17.9, 167.))
+    assert resolver.source == SpeedLimitSource.map
+    assert 21.5 < resolver.speed_limit < 22.5
+    assert abs(resolver.distance - 167. + 24.6 * 0.05) < 2.
+
+  def test_no_ramp_when_map_disagrees_with_sign(self, mocker):
+    resolver = self._resolver()
+    resolver.update(24.6, self._sm(mocker, 24.6, 20., 17.9, 167.))
+    assert resolver.source == SpeedLimitSource.car
+    assert resolver.speed_limit == 24.6
+
+  def test_no_ramp_for_higher_limit_or_no_ahead(self, mocker):
+    resolver = self._resolver()
+    resolver.update(24.6, self._sm(mocker, 24.6, 24.6, 31.3, 167.))
+    assert resolver.source == SpeedLimitSource.car
+    resolver.update(24.6, self._sm(mocker, 24.6, 24.6, 0., 0.))
+    assert resolver.source == SpeedLimitSource.car
+
+  def test_far_ahead_or_stale_fix_ignored(self, mocker):
+    resolver = self._resolver()
+    resolver.update(24.6, self._sm(mocker, 24.6, 24.6, 17.9, 900.))
+    assert resolver.source == SpeedLimitSource.car
+    resolver.update(24.6, self._sm(mocker, 24.6, 24.6, 17.9, 167., fix_age=2 * LIMIT_MAX_MAP_DATA_AGE))
+    assert resolver.source == SpeedLimitSource.car
+
+  def test_never_above_the_sign(self, mocker):
+    # right at the sign the ramp equals the lower limit; far from it, it is capped at the car's limit
+    resolver = self._resolver()
+    resolver.update(24.6, self._sm(mocker, 24.6, 24.6, 17.9, 0.))
+    assert abs(resolver.speed_limit - 17.9) < 0.01
+    resolver.update(24.6, self._sm(mocker, 24.6, 24.6, 17.9, 599.))
+    assert resolver.speed_limit == 24.6 and resolver.source == SpeedLimitSource.car
