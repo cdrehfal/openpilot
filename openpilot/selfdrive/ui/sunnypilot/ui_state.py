@@ -115,6 +115,11 @@ class UIStateSP:
     mads_state = mads.state
 
     if state == OpenpilotState.preEnabled:
+      # Fork: preEnabled here is the stock cruise holding the car at a standstill. openpilot's steering is in the
+      # same paused-at-standstill state it is in when stopped in steering-only mode, so show the same look
+      # (steering-only colours) rather than the white 'override' look, for consistency between the two modes.
+      if mads.available and mads.enabled and mads_state not in (MADSState.paused, MADSState.overriding):
+        return "lat_only"
       return "override"
 
     if state == OpenpilotState.overriding:
