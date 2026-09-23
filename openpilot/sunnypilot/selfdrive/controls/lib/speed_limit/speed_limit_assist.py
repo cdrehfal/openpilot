@@ -45,6 +45,11 @@ CRUISE_BUTTONS_PLUS = (ButtonType.accelCruise, ButtonType.resumeCruise)
 CRUISE_BUTTONS_MINUS = (ButtonType.decelCruise, ButtonType.setCruise)
 CRUISE_BUTTON_CONFIRM_HOLD = 0.5  # secs.
 
+# Fork: automatic set-speed changes on any road when the posted limit is at least this (else ask for a tap)
+AUTO_APPLY_MIN_LIMIT = {True: 55, False: 35}  # km/h, mph
+# ...and when the set speed would not drop by more than this at once
+AUTO_APPLY_MAX_DROP = {True: 40, False: 25}  # km/h, mph
+
 
 class SpeedLimitAssist:
   _speed_limit_final_last: float
@@ -192,14 +197,16 @@ class SpeedLimitAssist:
 
   @property
   def apply_confirm_speed_threshold(self) -> bool:
-    # below CST: always require user confirmation
-    if self.v_cruise_cluster_below_confirm_speed_threshold:
+    # Fork: follow the car's posted limit automatically on all roads, not only at freeway speeds.
+    # Stock sunnypilot asks for a +/- tap unless both the set speed and the new limit are >= 50 mph.
+    # Here a tap is only asked for when the new posted limit is low (< 35 mph: school zones, side-road
+    # signs the camera catches in passing) or the change would be a large drop at once (> 25 mph).
+    speed_conv = CV.MS_TO_KPH if self.is_metric else CV.MS_TO_MPH
+    posted = self._speed_limit * speed_conv
+    if posted < AUTO_APPLY_MIN_LIMIT[self.is_metric]:
       return True
-
-    # at/above CST:
-    # - new speed limit >= CST: auto change
-    # - new speed limit < CST: user confirmation required
-    return bool(self.speed_limit_final_last_conv < CONFIRM_SPEED_THRESHOLD[self.is_metric])
+    drop = self.v_cruise_cluster_conv - self.speed_limit_final_last_conv
+    return bool(drop > AUTO_APPLY_MAX_DROP[self.is_metric])
 
   def get_current_acceleration_as_target(self) -> float:
     return self.a_ego
