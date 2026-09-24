@@ -45,8 +45,9 @@ CRUISE_BUTTONS_PLUS = (ButtonType.accelCruise, ButtonType.resumeCruise)
 CRUISE_BUTTONS_MINUS = (ButtonType.decelCruise, ButtonType.setCruise)
 CRUISE_BUTTON_CONFIRM_HOLD = 0.5  # secs.
 
-# Fork: automatic set-speed changes on any road when the posted limit is at least this (else ask for a tap)
-AUTO_APPLY_MIN_LIMIT = {True: 55, False: 35}  # km/h, mph
+# Fork: automatic set-speed changes on any road when the posted limit is at least this (else ask for a tap).
+# Below it the camera reads too many signs that aren't the road's limit (ATV/trail 35, school zones, ramps).
+AUTO_APPLY_MIN_LIMIT = {True: 70, False: 45}  # km/h, mph
 # ...and when the set speed would not drop by more than this at once
 AUTO_APPLY_MAX_DROP = {True: 40, False: 25}  # km/h, mph
 
@@ -199,8 +200,8 @@ class SpeedLimitAssist:
   def apply_confirm_speed_threshold(self) -> bool:
     # Fork: follow the car's posted limit automatically on all roads, not only at freeway speeds.
     # Stock sunnypilot asks for a +/- tap unless both the set speed and the new limit are >= 50 mph.
-    # Here a tap is only asked for when the new posted limit is low (< 35 mph: school zones, side-road
-    # signs the camera catches in passing) or the change would be a large drop at once (> 25 mph).
+    # Here a tap is only asked for when the new posted limit is low (< 45 mph: school zones, ATV/trail and
+    # side-road signs the camera catches in passing) or the change would be a large drop at once (> 25 mph).
     speed_conv = CV.MS_TO_KPH if self.is_metric else CV.MS_TO_MPH
     posted = self._speed_limit * speed_conv
     if posted < AUTO_APPLY_MIN_LIMIT[self.is_metric]:

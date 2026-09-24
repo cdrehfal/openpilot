@@ -91,11 +91,11 @@ class SpeedLimitResolver:
 
   @property
   def speed_limit_valid(self) -> bool:
-    return self.speed_limit > 0.
+    return bool(self.speed_limit > 0.)
 
   @property
   def speed_limit_last_valid(self) -> bool:
-    return self.speed_limit_last > 0.
+    return bool(self.speed_limit_last > 0.)
 
   def update_params(self):
     if self.frame % int(PARAMS_UPDATE_PERIOD / DT_MDL) == 0:
@@ -215,10 +215,12 @@ class SpeedLimitResolver:
 
     # speed that reaches next_limit exactly at the sign with a constant, gentle deceleration
     ramp = (next_limit ** 2 + 2. * ANTICIPATE_DECEL * dist_ahead) ** 0.5
-    return min(ramp, car_limit), dist_ahead
+    # plain floats: v_ego comes from the planner's filter as a numpy float, and a numpy result here made
+    # speed_limit_valid a numpy.bool, which capnp refuses when plannerd publishes (crashed plannerd, Sep 24)
+    return float(min(ramp, car_limit)), float(dist_ahead)
 
   def update(self, v_ego: float, sm: messaging.SubMaster) -> None:
-    self.v_ego = v_ego
+    self.v_ego = float(v_ego)
     self.update_params()
 
     self.speed_limit, self.distance, self.source = self._resolve_limit_sources(sm)

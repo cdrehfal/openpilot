@@ -207,3 +207,20 @@ class TestAnticipateLowerLimitAhead(OpenpilotTestCase):
     assert abs(resolver.speed_limit - 17.9) < 0.01
     resolver.update(24.6, self._sm(mocker, 24.6, 24.6, 17.9, 599.))
     assert resolver.speed_limit == 24.6 and resolver.source == SpeedLimitSource.car
+
+  def test_numpy_speed_publishes(self, mocker):
+    # plannerd passes v_ego from a FirstOrderFilter (numpy float64). The anticipation result must still be
+    # plain Python types, or setting speedLimitValid on the capnp message raises (crashed plannerd, Sep 24).
+    import numpy as np
+    resolver = self._resolver()
+    resolver.update(np.float64(24.6), self._sm(mocker, 24.6, 24.6, 17.9, 167.))
+    assert resolver.source == SpeedLimitSource.map
+    assert type(resolver.speed_limit_valid) is bool and type(resolver.speed_limit_last_valid) is bool
+    msg = custom.LongitudinalPlanSP.new_message()
+    r = msg.speedLimit.resolver
+    r.speedLimit = float(resolver.speed_limit)
+    r.speedLimitValid = resolver.speed_limit_valid
+    r.speedLimitLastValid = resolver.speed_limit_last_valid
+    r.distToSpeedLimit = float(resolver.distance)
+    r.source = resolver.source
+    assert r.speedLimitValid
