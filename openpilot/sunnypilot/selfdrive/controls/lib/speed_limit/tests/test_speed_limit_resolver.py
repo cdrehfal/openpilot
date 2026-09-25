@@ -4,15 +4,19 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
+import math
 import random
 import time
+from unittest import mock
 
 from openpilot.common.parameterized import parameterized
 
 from openpilot.cereal import custom
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import LIMIT_MAX_MAP_DATA_AGE
 
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver, ALL_SOURCES
+from openpilot.common.constants import CV
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver, ALL_SOURCES, \
+  ANTICIPATE_DECEL
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Policy
 from openpilot.common.test import OpenpilotTestCase
 
@@ -147,75 +151,132 @@ class TestSpeedLimitResolverValidation(OpenpilotTestCase):
     assert resolver.distance_solutions[SpeedLimitSource.map] == 0.
 
 
-class TestAnticipateLowerLimitAhead(OpenpilotTestCase):
-  """Fork: ease off toward a lower limit the map says is ahead, keyed on the message receive time (not the
-  receiver's wall-clock timestamp, which is what the device logs and what stopped this from ever firing)."""
+class _Clock:
+  now = 1000.
 
-  def _sm(self, mocker, car_limit, map_limit, ahead, dist, fix_age=0.05):
-    sm = mocker.MagicMock()
-    sm.__getitem__.side_effect = lambda key: {
-      'carState': create_mock({'gasPressed': False, 'brakePressed': False, 'standstill': False}, mocker),
-      'carStateSP': create_mock({'speedLimit': car_limit}, mocker),
-      'liveMapDataSP': create_mock({'speedLimit': map_limit, 'speedLimitValid': map_limit > 0,
-                                    'speedLimitAhead': ahead, 'speedLimitAheadValid': ahead > 0,
-                                    'speedLimitAheadDistance': dist}, mocker),
-      # what the device logs: wall-clock milliseconds, ~1.7e12
-      'gpsLocation': create_mock({'unixTimestampMillis': time.time() * 1e3}, mocker),
-      'gpsLocationExternal': create_mock({'unixTimestampMillis': time.time() * 1e3}, mocker),
-    }[key]
-    mono = (time.monotonic() - fix_age) * 1e9
-    sm.logMonoTime = {'gpsLocation': mono, 'gpsLocationExternal': mono}
+  @classmethod
+  def monotonic(cls):
+    return cls.now
+
+
+MPH = CV.MS_TO_MPH
+
+
+class TestAnticipateLowerLimitAhead(OpenpilotTestCase):
+  """Fork: ease off toward a lower limit the map says is ahead. Ages are taken from the messages' receive times
+  (the receiver's wall-clock timestamp is what the device logs, and what stopped this from ever firing)."""
+
+  def setup_method(self):
+    import openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver as R
+    self._patch = mock.patch.object(R, 'time', _Clock)
+    self._patch.start()
+    _Clock.now = 1000.
+
+  def teardown_method(self):
+    self._patch.stop()
+
+  def _sm(self, car_limit, map_limit, ahead, dist, fix_age=0.05, map_age=0.0):
+    sm = mock.MagicMock()
+    msgs = {
+      'carState': mock.MagicMock(gasPressed=False, brakePressed=False, standstill=False),
+      'carStateSP': mock.MagicMock(speedLimit=car_limit),
+      'liveMapDataSP': mock.MagicMock(speedLimit=map_limit, speedLimitValid=map_limit > 0, speedLimitAhead=ahead,
+                                      speedLimitAheadValid=ahead > 0, speedLimitAheadDistance=dist),
+      # what the device logs: wall-clock milliseconds
+      'gpsLocation': mock.MagicMock(unixTimestampMillis=1.79e12),
+      'gpsLocationExternal': mock.MagicMock(unixTimestampMillis=1.79e12),
+    }
+    sm.__getitem__.side_effect = lambda key: msgs[key]
+    gps = (_Clock.now - fix_age) * 1e9
+    sm.logMonoTime = {'gpsLocation': gps, 'gpsLocationExternal': gps, 'liveMapDataSP': (_Clock.now - map_age) * 1e9}
     return sm
 
   def _resolver(self):
     resolver = SpeedLimitResolver()
     resolver.policy = Policy.car_state_only
+    resolver.is_metric = False
     return resolver
 
-  def test_ramps_toward_lower_limit_ahead(self, mocker):
-    # 55 mph, map agrees, 40 mph in 167 m: aim below 55 now along the ramp, sourced to the map
-    from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import ANTICIPATE_DECEL
+  def _drive(self, resolver, v, seconds, sm_fn):
+    """step 20 Hz for `seconds` at speed v; sm_fn(dist_travelled) builds the inputs"""
+    out, travelled = [], 0.
+    for _ in range(int(seconds * 20)):
+      resolver.update(v, sm_fn(travelled))
+      out.append((resolver.speed_limit, resolver.source, resolver.easing_step))
+      _Clock.now += 0.05
+      travelled += v * 0.05
+    return out
+
+  def test_ramps_in_whole_mph_toward_lower_limit(self):
+    # 70 mph, map agrees, 55 mph in 200 m
+    car, nxt = 70 / MPH, 55 / MPH
     resolver = self._resolver()
-    resolver.update(24.6, self._sm(mocker, 24.6, 24.6, 17.9, 167.))
+    resolver.update(car, self._sm(car, car, nxt, 200.))
     assert resolver.source == SpeedLimitSource.map
-    expected = (17.9 ** 2 + 2 * ANTICIPATE_DECEL * (167. - 24.6 * 0.05)) ** 0.5
-    assert abs(resolver.speed_limit - expected) < 0.1 and resolver.speed_limit < 24.6
-    assert abs(resolver.distance - 167. + 24.6 * 0.05) < 2.
+    ramp = (nxt ** 2 + 2 * ANTICIPATE_DECEL * 200.) ** 0.5
+    assert resolver.speed_limit * MPH == math.ceil(ramp * MPH - 1e-6)
+    assert type(resolver.speed_limit) is float
 
-  def test_no_ramp_when_map_disagrees_with_sign(self, mocker):
+  def test_steps_about_twice_a_second_and_announces_once(self):
+    car, nxt = 70 / MPH, 55 / MPH
     resolver = self._resolver()
-    resolver.update(24.6, self._sm(mocker, 24.6, 20., 17.9, 167.))
-    assert resolver.source == SpeedLimitSource.car
-    assert resolver.speed_limit == 24.6
+    out = self._drive(resolver, 30., 8., lambda x: self._sm(car, car, nxt, max(0., 240. - x)))
+    values = [round(v * MPH, 3) for v, _, _ in out]
+    assert all(abs(v - round(v)) < 1e-6 for v in values)       # whole mph only
+    changes = sum(1 for a, b in zip(values, values[1:], strict=False) if a != b)
+    assert changes <= 16 and values[-1] <= 56                    # ~1 step per mph, down to the new limit
+    eased = [e for _, src, e in out if src == SpeedLimitSource.map]
+    assert eased and eased[0] is False and all(eased[1:])       # only the first eased step announces
 
-  def test_no_ramp_for_higher_limit_or_no_ahead(self, mocker):
+  def test_no_ramp_when_map_disagrees_with_sign(self):
     resolver = self._resolver()
-    resolver.update(24.6, self._sm(mocker, 24.6, 24.6, 31.3, 167.))
-    assert resolver.source == SpeedLimitSource.car
-    resolver.update(24.6, self._sm(mocker, 24.6, 24.6, 0., 0.))
-    assert resolver.source == SpeedLimitSource.car
+    resolver.update(24.6, self._sm(24.6, 20., 20.1, 167.))
+    assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == 24.6
 
-  def test_far_ahead_or_stale_fix_ignored(self, mocker):
+  def test_no_ramp_for_higher_limit_far_ahead_or_stale(self):
     resolver = self._resolver()
-    resolver.update(24.6, self._sm(mocker, 24.6, 24.6, 17.9, 900.))
-    assert resolver.source == SpeedLimitSource.car
-    resolver.update(24.6, self._sm(mocker, 24.6, 24.6, 17.9, 167., fix_age=2 * LIMIT_MAX_MAP_DATA_AGE))
-    assert resolver.source == SpeedLimitSource.car
+    for sm in (self._sm(24.6, 24.6, 31.3, 167.), self._sm(24.6, 24.6, 0., 0.), self._sm(24.6, 24.6, 20.1, 900.),
+               self._sm(24.6, 24.6, 20.1, 167., fix_age=2 * LIMIT_MAX_MAP_DATA_AGE), self._sm(24.6, 24.6, 20.1, 167., map_age=5.)):
+      resolver = self._resolver()
+      resolver.update(24.6, sm)
+      assert resolver.source == SpeedLimitSource.car, sm
 
-  def test_never_above_the_sign(self, mocker):
-    # right at the sign the ramp equals the lower limit; far from it, it is capped at the car's limit
+  def test_no_easing_below_auto_apply_floor(self):
+    # 55 -> 40: below 45 mph the driver confirms at the sign, so no easing toward it
     resolver = self._resolver()
-    resolver.update(24.6, self._sm(mocker, 24.6, 24.6, 17.9, 0.))
-    assert abs(resolver.speed_limit - 17.9) < 0.01
-    resolver.update(24.6, self._sm(mocker, 24.6, 24.6, 17.9, 599.))
-    assert resolver.speed_limit == 24.6 and resolver.source == SpeedLimitSource.car
+    resolver.update(24.6, self._sm(55 / MPH, 55 / MPH, 40 / MPH, 100.))
+    assert resolver.source == SpeedLimitSource.car
+    resolver.update(24.6, self._sm(55 / MPH, 55 / MPH, 45 / MPH, 100.))
+    assert resolver.source == SpeedLimitSource.map
 
-  def test_numpy_speed_publishes(self, mocker):
-    # plannerd passes v_ego from a FirstOrderFilter (numpy float64). The anticipation result must still be
-    # plain Python types, or setting speedLimitValid on the capnp message raises (crashed plannerd, Sep 24).
+  def test_holds_through_map_dropout_until_camera_reads_sign(self):
+    car, nxt = 70 / MPH, 55 / MPH
+    resolver = self._resolver()
+    self._drive(resolver, 30., 3., lambda x: self._sm(car, car, nxt, max(0., 240. - x)))
+    before = resolver.speed_limit
+    assert resolver.source == SpeedLimitSource.map
+    # map loses the limit ahead, then switches to the new limit before the camera reads the sign
+    self._drive(resolver, 30., 1., lambda x: self._sm(car, car, 0., 0.))
+    assert resolver.source == SpeedLimitSource.map and resolver.speed_limit <= before
+    self._drive(resolver, 30., 5., lambda x: self._sm(car, nxt, 0., 0.))  # passes the sign
+    assert resolver.source == SpeedLimitSource.map and round(resolver.speed_limit * MPH) == 55
+    # camera reads 55: camera wins
+    resolver.update(30., self._sm(nxt, nxt, 0., 0.))
+    assert resolver.source == SpeedLimitSource.car and round(resolver.speed_limit * MPH) == 55
+
+  def test_releases_well_past_the_sign(self):
+    car, nxt = 70 / MPH, 55 / MPH
+    resolver = self._resolver()
+    self._drive(resolver, 30., 1., lambda x: self._sm(car, car, nxt, max(0., 100. - x)))
+    self._drive(resolver, 30., 16., lambda x: self._sm(car, car, 0., 0.))  # ~480 m more, camera never reads it
+    assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == car
+
+  def test_numpy_speed_publishes(self):
+    # plannerd passes v_ego from a FirstOrderFilter (numpy float64). Outputs must be plain Python types, or setting
+    # speedLimitValid on the capnp message raises (crashed plannerd, Sep 24).
     import numpy as np
     resolver = self._resolver()
-    resolver.update(np.float64(24.6), self._sm(mocker, 24.6, 24.6, 17.9, 167.))
+    resolver.update(np.float64(24.6), self._sm(55 / MPH, 55 / MPH, 45 / MPH, 100.))
     assert resolver.source == SpeedLimitSource.map
     assert type(resolver.speed_limit_valid) is bool and type(resolver.speed_limit_last_valid) is bool
     msg = custom.LongitudinalPlanSP.new_message()

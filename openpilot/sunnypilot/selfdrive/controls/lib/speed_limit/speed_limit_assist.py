@@ -15,7 +15,8 @@ from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import PCM_LONG_REQUIRED_MAX_SET_SPEED, CONFIRM_SPEED_THRESHOLD
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import PCM_LONG_REQUIRED_MAX_SET_SPEED, CONFIRM_SPEED_THRESHOLD, \
+  AUTO_APPLY_MIN_LIMIT
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Mode
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import compare_cluster_target, set_speed_limit_assist_availability
 
@@ -45,9 +46,8 @@ CRUISE_BUTTONS_PLUS = (ButtonType.accelCruise, ButtonType.resumeCruise)
 CRUISE_BUTTONS_MINUS = (ButtonType.decelCruise, ButtonType.setCruise)
 CRUISE_BUTTON_CONFIRM_HOLD = 0.5  # secs.
 
-# Fork: automatic set-speed changes on any road when the posted limit is at least this (else ask for a tap).
-# Below it the camera reads too many signs that aren't the road's limit (ATV/trail 35, school zones, ramps).
-AUTO_APPLY_MIN_LIMIT = {True: 70, False: 45}  # km/h, mph
+# Fork: automatic set-speed changes on any road when the posted limit is at least AUTO_APPLY_MIN_LIMIT (else ask
+# for a tap). Below it the camera reads too many signs that aren't the road's limit (ATV/trail 35, school zones).
 # ...and when the set speed would not drop by more than this at once
 AUTO_APPLY_MAX_DROP = {True: 40, False: 25}  # km/h, mph
 
@@ -94,6 +94,7 @@ class SpeedLimitAssist:
     self.state = SpeedLimitAssistState.disabled
     self._state_prev = SpeedLimitAssistState.disabled
     self.pcm_op_long = CP.openpilotLongitudinalControl and CP.pcmCruise
+    self._quiet_change = False
 
     self._plus_hold = 0.
     self._minus_hold = 0.
@@ -324,7 +325,10 @@ class SpeedLimitAssist:
       else:
         # ACTIVE
         if self.state == SpeedLimitAssistState.active:
-          if self.v_cruise_cluster_changed:
+          # Fork: a set-speed change that lands exactly on our own target is ours (button management following
+          # the limit), not the driver's. Stock dropped to inactive and re-confirmed a frame later, which is
+          # harmless for one step but broke on the map easing, whose target moves every half second.
+          if self.v_cruise_cluster_changed and not self.target_set_speed_confirmed:
             self.state = SpeedLimitAssistState.inactive
 
           elif self.speed_limit_changed and self.apply_confirm_speed_threshold:
@@ -341,7 +345,9 @@ class SpeedLimitAssist:
 
         # INACTIVE
         elif self.state == SpeedLimitAssistState.inactive:
-          if self.speed_limit_changed:
+          # Fork: after the driver overrode the set speed, the map easing's 1 mph steps don't ask to be
+          # confirmed; the sign itself, when the camera reads it, still does.
+          if self.speed_limit_changed and not self._quiet_change:
             self.state = SpeedLimitAssistState.preActive
             self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[self.pcm_op_long] / DT_MDL)
           elif self._update_non_pcm_long_confirmed_state():
@@ -369,6 +375,7 @@ class SpeedLimitAssist:
     return enabled, active
 
   def update_events(self, events_sp: EventsSP) -> None:
+    quiet = self._quiet_change
     if self.state == SpeedLimitAssistState.preActive:
       events_sp.add(EventNameSP.speedLimitPreActive)
 
@@ -381,15 +388,18 @@ class SpeedLimitAssist:
 
       # only notify if we acquire a valid speed limit
       # do not check has_speed_limit here
-      elif self._speed_limit != self.speed_limit_prev:
+      # Fork: not on each 1 mph step of the map easing (it announced itself once when it started)
+      elif self._speed_limit != self.speed_limit_prev and not quiet:
         if self.speed_limit_prev <= 0:
           self.update_active_event(events_sp)
         elif self.speed_limit_prev > 0 and self._speed_limit > 0:
           self.update_active_event(events_sp)
 
   def update(self, long_enabled: bool, long_override: bool, v_ego: float, a_ego: float, v_cruise_cluster: float, speed_limit: float,
-             speed_limit_final_last: float, has_speed_limit: bool, distance: float, events_sp: EventsSP) -> None:
+             speed_limit_final_last: float, has_speed_limit: bool, distance: float, events_sp: EventsSP,
+             quiet_change: bool = False) -> None:
     self.long_enabled = long_enabled
+    self._quiet_change = quiet_change
     self.v_ego = v_ego
     self.a_ego = a_ego
 
