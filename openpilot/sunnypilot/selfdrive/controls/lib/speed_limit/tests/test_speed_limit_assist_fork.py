@@ -51,3 +51,25 @@ class TestApplyOrAsk:
     assert not asks(100, 110, metric=True)
     assert asks(50, 90, metric=True)
     assert not asks(50, 90, map_agrees=True, metric=True)
+
+
+class TestAnnouncements:
+  def _sla(self):
+    sla = SpeedLimitAssist.__new__(SpeedLimitAssist)
+    sla.is_metric = False
+    sla._last_announced = None
+    sla.v_cruise_cluster_conv = 60
+    sla.speed_limit_final_last_conv = 60
+    return sla
+
+  def test_resume_doesnt_repeat_but_changes_do(self):
+    from unittest import mock
+    import openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist as A
+    events = mock.MagicMock()
+    sla = self._sla()
+    with mock.patch.object(A.time, 'monotonic', side_effect=[0., 30., 40., 400.]):
+      sla.update_active_event(events)                     # announced
+      sla.update_active_event(events, reactivation=True)  # resume 30 s later, same limit: quiet
+      sla.update_active_event(events)                     # a change to the same set speed (easing starts): announced
+      sla.update_active_event(events, reactivation=True)  # resume much later: announced
+    assert events.add.call_count == 3

@@ -59,23 +59,14 @@ def _speed_limit_facts(sm: messaging.SubMaster, metric: bool) -> dict:
   return facts
 
 
-def _map_note(f: dict) -> str:
-  if abs(f['map'] - f['limit']) <= 2 or abs(f['ahead'] - f['limit']) <= 2:
-    return "map agrees"
-  if f['map'] == 0:
-    return "not on map"
-  return f"map says {f['map']}"
-
-
 def speed_limit_applied_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int,
                               personality) -> Alert:
-  """Fork: say what was applied and why: 'Limit 55: set 60 / sign, map agrees', or for the map easing
-  '45 ahead: slowing / map, 50 at the sign'."""
+  """Fork: say what was applied: 'Speed limit 55 / set to 60', or for the map easing 'Slowing for 45 / limit ahead'."""
   f = _speed_limit_facts(sm, metric)
   if f['easing'] and f['ahead']:
-    text1, text2 = f"{f['ahead']} ahead: slowing", f"map, {f['ahead'] + f['offset']} at the sign"
+    text1, text2 = f"Slowing for {f['ahead']}", "limit ahead"
   else:
-    text1, text2 = f"Limit {f['limit']}: set {f['final']}", f"sign, {_map_note(f)}"
+    text1, text2 = f"Speed limit {f['limit']}", f"set to {f['final']}"
   return Alert(text1, text2, AlertStatus.normal, AlertSize.mid,
                Priority.LOW, VisualAlert.none, AudibleAlertSP.promptSingleHigh, 5.)
 
@@ -102,16 +93,14 @@ def speed_limit_pre_active_alert(CP: car.CarParams, CS: car.CarState, sm: messag
 
     alert_1_str = f"Speed Limit Assist: set to {pcm_long_required_max_set_speed_conv} {speed_unit} to engage"
   else:
-    # Fork: name the sign, the set speed a tap gives, and why it asks: 'Sign 35: tap - / for 40, not on map'
+    # Fork: 'Speed limit 35? / tap - to set 40' (the question mark is the hint that it isn't sure)
     f = _speed_limit_facts(sm, metric)
     alert_2_str = ""
     if set_speed_conv != speed_limit_final_last_conv:
       tap = "+" if set_speed_conv < speed_limit_final_last_conv else "-"
-      alert_1_str = f"Sign {f['limit']}: tap {tap}"
-      alert_2_str = f"for {speed_limit_final_last_conv}, {_map_note(f)}"
+      alert_1_str = f"Speed limit {f['limit']}?"
+      alert_2_str = f"tap {tap} to set {speed_limit_final_last_conv}"
     alert_size = AlertSize.mid if alert_1_str else AlertSize.none
-    if not IS_MICI and alert_1_str:
-      alert_1_str, alert_2_str = f"{alert_1_str} for {speed_limit_final_last_conv}", _map_note(f)
     return Alert(
       alert_1_str,
       alert_2_str,

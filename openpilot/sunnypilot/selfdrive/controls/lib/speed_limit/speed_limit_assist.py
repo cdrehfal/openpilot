@@ -52,6 +52,7 @@ CRUISE_BUTTON_CONFIRM_HOLD = 0.5  # secs.
 #   - the map has nothing: apply between highway limits (both >= 55 mph / 90 km/h) and for increases from
 #     an arterial limit (>= 45 mph / 70 km/h); ask for everything else (drops onto slower roads, low limits)
 HIGHWAY_LIMIT = {True: 90, False: 55}   # km/h, mph
+REPEAT_ANNOUNCE_QUIET = 120.  # s, the same limit isn't announced again within this
 ARTERIAL_LIMIT = {True: 70, False: 45}  # km/h, mph
 
 
@@ -102,6 +103,7 @@ class SpeedLimitAssist:
     self._map_conflict = False
     self._sign_prev = 0.
     self._unconfirmed = False  # Fork: a limit that was asked about and not answered
+    self._last_announced: tuple[int, float] | None = None
 
     self._plus_hold = 0.
     self._minus_hold = 0.
@@ -134,7 +136,13 @@ class SpeedLimitAssist:
   def v_cruise_cluster_below_confirm_speed_threshold(self) -> bool:
     return bool(self.v_cruise_cluster_conv < CONFIRM_SPEED_THRESHOLD[self.is_metric])
 
-  def update_active_event(self, events_sp: EventsSP) -> None:
+  def update_active_event(self, events_sp: EventsSP, reactivation: bool = False) -> None:
+    # Fork: on re-engaging (e.g. every cruise resume in town), don't repeat what was just announced; a change always is
+    now = time.monotonic()
+    if reactivation and self._last_announced is not None and self._last_announced[0] == self.speed_limit_final_last_conv and \
+       now - self._last_announced[1] < REPEAT_ANNOUNCE_QUIET:
+      return
+    self._last_announced = (self.speed_limit_final_last_conv, now)
     if self.v_cruise_cluster_below_confirm_speed_threshold:
       events_sp.add(EventNameSP.speedLimitChanged)
     else:
@@ -411,7 +419,7 @@ class SpeedLimitAssist:
 
     if self.is_active:
       if self._state_prev not in ACTIVE_STATES:
-        self.update_active_event(events_sp)
+        self.update_active_event(events_sp, reactivation=not self.speed_limit_changed)
 
       # only notify if we acquire a valid speed limit
       # do not check has_speed_limit here
