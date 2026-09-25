@@ -14,7 +14,7 @@ from openpilot.common.gps import get_gps_location_service
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD, get_sanitize_int_param
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import LIMIT_MAX_MAP_DATA_AGE, LIMIT_ADAPT_ACC, AUTO_APPLY_MIN_LIMIT
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import LIMIT_MAX_MAP_DATA_AGE, LIMIT_ADAPT_ACC
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Policy, OffsetType
 
 SpeedLimitSource = custom.LongitudinalPlanSP.SpeedLimit.Source
@@ -30,6 +30,18 @@ ANTICIPATE_AGREE_TOL = 1.0  # m/s, map current limit must match the car's readin
 ANTICIPATE_MAX_DIST = 600.  # m, ignore map limits further ahead than this
 ANTICIPATE_HOLD_PAST = 300.  # m, keep the lowered target this far past the sign while the camera hasn't read it yet
 MAP_MSG_MAX_AGE = 3.  # s, mapd publishes once a second
+
+# Fork: the car's camera reads more signs than the map knows about, but it also misreads (advisory and school
+# signs, signs on side roads and ramps, a flicker between two readings). A new camera reading is used only once
+# it is plausible for a posted US/metric limit and has held for a moment.
+SIGN_PLAUSIBLE = {True: (20, 130), False: (20, 85)}  # km/h, mph: readings outside are not posted road limits
+SIGN_STEP = {True: 5, False: 5}  # posted limits are multiples of 5
+SIGN_CONFIRM_TIME = 1.0  # s a new reading must hold before it is used
+# The map "agrees" with a sign when it gives the same limit for where the car is, or for a change point just
+# ahead or just behind (the map's change point and the real sign are often a few hundred metres apart).
+MAP_AGREE_TOL = 1.0  # m/s (~2 mph)
+MAP_AGREE_AHEAD = 800.  # m (seen: a 35 sign read 650 m before the map's change point)
+MAP_AGREE_MEMORY = 20.  # s, limits the map gave recently still count as agreeing
 
 
 class SpeedLimitResolver:
@@ -86,6 +98,17 @@ class SpeedLimitResolver:
     self._odometer = 0.
     self._last_update_t: float | None = None
     self._ease: tuple[float, float, float] | None = None  # (lower limit, car limit it started from, sign odometer)
+    self._ease_floor: tuple[tuple[float, float], float] | None = None  # lowest eased target so far in this easing
+    # camera reading filter
+    self.sign_limit = 0.  # the camera limit in use (m/s)
+    self.sign_limit_prev = 0.  # the one before it
+    self._sign_candidate = 0.
+    self._sign_candidate_t = 0.
+    # map agreement, for Speed Limit Assist to decide between applying a change and asking
+    self.map_limit = 0.  # map limit here, 0 if unknown
+    self.map_agrees = False
+    self.map_conflict = False
+    self._map_recent: list[tuple[float, float]] = []  # (limit, time) the map gave here or just ahead
     self.speed_limit_final = 0.
     self.speed_limit_final_last = 0.
     self.speed_limit_offset = 0.
@@ -128,8 +151,43 @@ class SpeedLimitResolver:
 
   def _get_from_car_state(self, sm: messaging.SubMaster) -> None:
     self._reset_limit_sources(SpeedLimitSource.car)
-    self.limit_solutions[SpeedLimitSource.car] = sm['carStateSP'].speedLimit
+    self.limit_solutions[SpeedLimitSource.car] = self._filter_sign(sm['carStateSP'].speedLimit)
     self.distance_solutions[SpeedLimitSource.car] = 0.
+
+  def _filter_sign(self, raw: float) -> float:
+    """The camera reading to use: implausible readings are ignored, a new one must hold for SIGN_CONFIRM_TIME,
+    and a momentary loss of the reading (0) keeps the last one."""
+    conv = CV.MS_TO_KPH if self.is_metric else CV.MS_TO_MPH
+    lo, hi = SIGN_PLAUSIBLE[self.is_metric]
+    raw_u = raw * conv
+    step = SIGN_STEP[self.is_metric]
+    plausible = lo - 0.5 <= raw_u <= hi + 0.5 and abs(raw_u / step - round(raw_u / step)) < 0.1
+    now = time.monotonic()
+    if not plausible or abs(raw - self.sign_limit) < 0.1:
+      self._sign_candidate = 0.
+      return self.sign_limit
+    if abs(raw - self._sign_candidate) >= 0.1:
+      self._sign_candidate, self._sign_candidate_t = raw, now
+    if now - self._sign_candidate_t >= SIGN_CONFIRM_TIME:
+      self.sign_limit_prev, self.sign_limit = self.sign_limit, float(raw)
+      self._sign_candidate = 0.
+    return self.sign_limit
+
+  def _update_map_agreement(self, sm: messaging.SubMaster) -> None:
+    """Whether the map backs up the camera's limit (map_agrees) or contradicts it (map_conflict)."""
+    now = time.monotonic()
+    map_data = sm['liveMapDataSP']
+    map_age = max(0., now - sm.logMonoTime['liveMapDataSP'] * 1e-9)
+    fresh = map_age <= MAP_MSG_MAX_AGE
+    self.map_limit = float(map_data.speedLimit) if fresh and map_data.speedLimitValid else 0.
+    if self.map_limit > 0.:
+      self._map_recent.append((self.map_limit, now))
+    if fresh and map_data.speedLimitAheadValid and map_data.speedLimitAheadDistance <= MAP_AGREE_AHEAD:
+      self._map_recent.append((float(map_data.speedLimitAhead), now))
+    self._map_recent = [(v, t) for v, t in self._map_recent if now - t <= MAP_AGREE_MEMORY][-200:]
+    lim = self.sign_limit
+    self.map_agrees = lim > 0. and any(abs(v - lim) <= MAP_AGREE_TOL for v, _ in self._map_recent)
+    self.map_conflict = lim > 0. and self.map_limit > 0. and not self.map_agrees
 
   def _get_from_map_data(self, sm: messaging.SubMaster) -> None:
     self._reset_limit_sources(SpeedLimitSource.map)
@@ -199,6 +257,8 @@ class SpeedLimitResolver:
         speed_limit, distance, source, eased = anticipated, dist_ahead, SpeedLimitSource.map, True
     else:
       self._ease = None
+    if self._ease is None:
+      self._ease_floor = None
     self.easing_step = eased and self.source == SpeedLimitSource.map  # a continuing easing, not its first step
 
     return speed_limit, distance, source
@@ -212,7 +272,7 @@ class SpeedLimitResolver:
     until the camera reads a new limit or the car is well past the sign.
     """
     conv = CV.MS_TO_KPH if self.is_metric else CV.MS_TO_MPH
-    min_limit = AUTO_APPLY_MIN_LIMIT[self.is_metric] / conv
+    min_limit = (SIGN_PLAUSIBLE[self.is_metric][0] - 0.5) / conv
 
     # the camera read something new: it wins
     if self._ease is not None and abs(self._ease[1] - car_limit) > ANTICIPATE_AGREE_TOL:
@@ -221,14 +281,17 @@ class SpeedLimitResolver:
     found = self._map_limit_ahead(sm, car_limit)
     if found is not None:
       next_limit, dist_ahead = found
-      if next_limit < min_limit:  # below the auto-apply floor the driver confirms at the sign anyway
+      if next_limit < min_limit:  # not a posted road limit
         self._ease = None
         return 0., 0.
       self._ease = (next_limit, car_limit, self._odometer + dist_ahead)
     elif self._ease is not None:
       next_limit, _, sign_at = self._ease
       dist_ahead = max(0., sign_at - self._odometer)
-      if self._odometer - sign_at > ANTICIPATE_HOLD_PAST:
+      # past the sign and the camera hasn't read it: keep the lower limit while the map still gives it here
+      # (the camera missed the sign), otherwise let go after ANTICIPATE_HOLD_PAST
+      map_still_says_it = abs(self.map_limit - next_limit) <= MAP_AGREE_TOL
+      if self._odometer - sign_at > ANTICIPATE_HOLD_PAST and not map_still_says_it:
         self._ease = None
         return 0., 0.
     else:
@@ -238,6 +301,12 @@ class SpeedLimitResolver:
     # whole unit so it steps down about twice a second instead of changing every frame
     ramp = (next_limit ** 2 + 2. * ANTICIPATE_DECEL * dist_ahead) ** 0.5
     ramp = math.ceil(ramp * conv - 1e-6) / conv
+    # only ever down within one easing: a map update that puts the sign a little farther than estimated (the map
+    # comes once a second) must not step the target back up, which read as a new change
+    key = (round(next_limit, 2), round(car_limit, 2))
+    if self._ease_floor is not None and self._ease_floor[0] == key:
+      ramp = min(ramp, self._ease_floor[1])
+    self._ease_floor = (key, ramp)
     # plain floats: v_ego comes from the planner's filter as a numpy float, and a numpy result here made
     # speed_limit_valid a numpy.bool, which capnp refuses when plannerd publishes (crashed plannerd, Sep 24)
     return float(min(ramp, car_limit)), float(dist_ahead)
@@ -276,6 +345,9 @@ class SpeedLimitResolver:
     self.update_params()
 
     self.speed_limit, self.distance, self.source = self._resolve_limit_sources(sm)
+    self._update_map_agreement(sm)
+    if self.source == SpeedLimitSource.map:  # the easing is map-backed by construction
+      self.map_agrees, self.map_conflict = True, False
     self.speed_limit_offset = self._get_speed_limit_offset()
 
     self.update_speed_limit_states()

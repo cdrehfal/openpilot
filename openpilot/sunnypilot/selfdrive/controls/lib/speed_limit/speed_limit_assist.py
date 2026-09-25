@@ -15,8 +15,7 @@ from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import PCM_LONG_REQUIRED_MAX_SET_SPEED, CONFIRM_SPEED_THRESHOLD, \
-  AUTO_APPLY_MIN_LIMIT
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import PCM_LONG_REQUIRED_MAX_SET_SPEED, CONFIRM_SPEED_THRESHOLD
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Mode
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import compare_cluster_target, set_speed_limit_assist_availability
 
@@ -32,7 +31,7 @@ DISABLED_GUARD_PERIOD = 0.5  # secs.
 # secs. Time to wait after activation before considering temp deactivation signal.
 PRE_ACTIVE_GUARD_PERIOD = {
   True: 15,
-  False: 5,
+  False: 8,  # Fork: 8 s to tap +/- (was 5)
 }
 SPEED_LIMIT_CHANGED_HOLD_PERIOD = 1  # secs. Time to wait after speed limit change before switching to preActive.
 
@@ -46,10 +45,14 @@ CRUISE_BUTTONS_PLUS = (ButtonType.accelCruise, ButtonType.resumeCruise)
 CRUISE_BUTTONS_MINUS = (ButtonType.decelCruise, ButtonType.setCruise)
 CRUISE_BUTTON_CONFIRM_HOLD = 0.5  # secs.
 
-# Fork: automatic set-speed changes on any road when the posted limit is at least AUTO_APPLY_MIN_LIMIT (else ask
-# for a tap). Below it the camera reads too many signs that aren't the road's limit (ATV/trail 35, school zones).
-# ...and when the set speed would not drop by more than this at once
-AUTO_APPLY_MAX_DROP = {True: 40, False: 25}  # km/h, mph
+# Fork: when a new limit is applied by itself and when the driver is asked to confirm it with a +/- tap.
+# The camera reads almost every sign but sometimes the wrong one; the map is often right but has gaps.
+#   - the map backs up the sign (same limit here, or at a change point just ahead/behind): apply
+#   - the map gives a different limit here: ask
+#   - the map has nothing: apply between highway limits (both >= 55 mph / 90 km/h) and for increases from
+#     an arterial limit (>= 45 mph / 70 km/h); ask for everything else (drops onto slower roads, low limits)
+HIGHWAY_LIMIT = {True: 90, False: 55}   # km/h, mph
+ARTERIAL_LIMIT = {True: 70, False: 45}  # km/h, mph
 
 
 class SpeedLimitAssist:
@@ -95,6 +98,10 @@ class SpeedLimitAssist:
     self._state_prev = SpeedLimitAssistState.disabled
     self.pcm_op_long = CP.openpilotLongitudinalControl and CP.pcmCruise
     self._quiet_change = False
+    self._map_agrees = False
+    self._map_conflict = False
+    self._sign_prev = 0.
+    self._unconfirmed = False  # Fork: a limit that was asked about and not answered
 
     self._plus_hold = 0.
     self._minus_hold = 0.
@@ -199,16 +206,20 @@ class SpeedLimitAssist:
 
   @property
   def apply_confirm_speed_threshold(self) -> bool:
-    # Fork: follow the car's posted limit automatically on all roads, not only at freeway speeds.
-    # Stock sunnypilot asks for a +/- tap unless both the set speed and the new limit are >= 50 mph.
-    # Here a tap is only asked for when the new posted limit is low (< 45 mph: school zones, ATV/trail and
-    # side-road signs the camera catches in passing) or the change would be a large drop at once (> 25 mph).
-    speed_conv = CV.MS_TO_KPH if self.is_metric else CV.MS_TO_MPH
-    posted = self._speed_limit * speed_conv
-    if posted < AUTO_APPLY_MIN_LIMIT[self.is_metric]:
+    """True when the driver should confirm the new limit with a +/- tap, False to apply it by itself.
+    See HIGHWAY_LIMIT above for the rules."""
+    if self._map_agrees:
+      return False
+    if self._map_conflict:
       return True
-    drop = self.v_cruise_cluster_conv - self.speed_limit_final_last_conv
-    return bool(drop > AUTO_APPLY_MAX_DROP[self.is_metric])
+    speed_conv = CV.MS_TO_KPH if self.is_metric else CV.MS_TO_MPH
+    posted = round(self._speed_limit * speed_conv)
+    prev = round(self._sign_prev * speed_conv)
+    if posted >= HIGHWAY_LIMIT[self.is_metric] and prev >= HIGHWAY_LIMIT[self.is_metric]:
+      return False
+    if posted > prev >= ARTERIAL_LIMIT[self.is_metric]:
+      return False
+    return True
 
   def get_current_acceleration_as_target(self) -> float:
     return self.a_ego
@@ -325,6 +336,7 @@ class SpeedLimitAssist:
       else:
         # ACTIVE
         if self.state == SpeedLimitAssistState.active:
+          self._unconfirmed = False
           # Fork: a set-speed change that lands exactly on our own target is ours (button management following
           # the limit), not the driver's. Stock dropped to inactive and re-confirmed a frame later, which is
           # harmless for one step but broke on the map easing, whose target moves every half second.
@@ -337,19 +349,30 @@ class SpeedLimitAssist:
 
         # PRE_ACTIVE
         elif self.state == SpeedLimitAssistState.preActive:
-          if self._update_non_pcm_long_confirmed_state():
+          # Fork: also accept by itself if the map catches up with the sign while asking
+          if self._update_non_pcm_long_confirmed_state() or not self.apply_confirm_speed_threshold:
             self.state = SpeedLimitAssistState.active
           elif self.pre_active_timer <= 0:
             # Timeout - session ended
             self.state = SpeedLimitAssistState.inactive
+            self._unconfirmed = True
 
         # INACTIVE
         elif self.state == SpeedLimitAssistState.inactive:
+          if self.v_cruise_cluster_changed:
+            self._unconfirmed = False  # the driver set a speed: that's the answer
           # Fork: after the driver overrode the set speed, the map easing's 1 mph steps don't ask to be
-          # confirmed; the sign itself, when the camera reads it, still does.
+          # confirmed; the next sign the camera reads is applied or asked about like any other.
           if self.speed_limit_changed and not self._quiet_change:
-            self.state = SpeedLimitAssistState.preActive
-            self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[self.pcm_op_long] / DT_MDL)
+            if self.apply_confirm_speed_threshold:
+              self.state = SpeedLimitAssistState.preActive
+              self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[self.pcm_op_long] / DT_MDL)
+            else:
+              self.state = SpeedLimitAssistState.active
+          # Fork: an unanswered limit is applied once the map backs it up (e.g. a freeway limit read on the on-ramp,
+          # before the map has the car on the freeway)
+          elif self._unconfirmed and not self.apply_confirm_speed_threshold:
+            self.state = SpeedLimitAssistState.active
           elif self._update_non_pcm_long_confirmed_state():
             self.state = SpeedLimitAssistState.active
 
@@ -364,8 +387,12 @@ class SpeedLimitAssist:
           if self._update_non_pcm_long_confirmed_state():
             self.state = SpeedLimitAssistState.active
           elif self._has_speed_limit:
-            self.state = SpeedLimitAssistState.preActive
-            self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[self.pcm_op_long] / DT_MDL)
+            # Fork: on engaging, a limit that would be applied by itself is applied (announced), else asked
+            if self.apply_confirm_speed_threshold:
+              self.state = SpeedLimitAssistState.preActive
+              self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[self.pcm_op_long] / DT_MDL)
+            else:
+              self.state = SpeedLimitAssistState.active
           else:
             self.state = SpeedLimitAssistState.inactive
 
@@ -397,9 +424,12 @@ class SpeedLimitAssist:
 
   def update(self, long_enabled: bool, long_override: bool, v_ego: float, a_ego: float, v_cruise_cluster: float, speed_limit: float,
              speed_limit_final_last: float, has_speed_limit: bool, distance: float, events_sp: EventsSP,
-             quiet_change: bool = False) -> None:
+             quiet_change: bool = False, map_agrees: bool = False, map_conflict: bool = False, sign_prev: float = 0.) -> None:
     self.long_enabled = long_enabled
     self._quiet_change = quiet_change
+    self._map_agrees = map_agrees
+    self._map_conflict = map_conflict
+    self._sign_prev = sign_prev
     self.v_ego = v_ego
     self.a_ego = a_ego
 

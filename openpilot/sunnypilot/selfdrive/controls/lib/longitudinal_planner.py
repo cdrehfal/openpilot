@@ -61,7 +61,8 @@ class LongitudinalPlannerSP:
     has_speed_limit = self.resolver.speed_limit_valid or self.resolver.speed_limit_last_valid
     self.sla.update(long_enabled, long_override, v_ego, a_ego, v_cruise_cluster, self.resolver.speed_limit,
                     self.resolver.speed_limit_final_last, has_speed_limit, self.resolver.distance, self.events_sp,
-                    quiet_change=self.resolver.easing_step)
+                    quiet_change=self.resolver.easing_step, map_agrees=self.resolver.map_agrees,
+                    map_conflict=self.resolver.map_conflict, sign_prev=self.resolver.sign_limit_prev)
 
     targets = {
       LongitudinalPlanSource.cruise: (v_cruise, a_ego),

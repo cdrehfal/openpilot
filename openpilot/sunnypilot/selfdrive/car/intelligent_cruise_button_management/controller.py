@@ -18,6 +18,9 @@ SendButtonState = custom.IntelligentCruiseButtonManagement.SendButtonState
 
 ALLOWED_SPEED_THRESHOLD = 1.8  # m/s, ~4 MPH
 HYST_GAP = 0.0  # currently disabled; TODO-SP: might need to be brand-specific
+# Fork: curve slowing's target wobbles by a unit or so through a curve, and each wobble was a button press (the set
+# speed chattered 53-54-53-57). Hold the target within 1 unit while curve slowing is the source.
+VISION_HYST_GAP = 1.0  # km/h or mph
 INACTIVE_TIMER = 0.4
 
 
@@ -41,6 +44,8 @@ class IntelligentCruiseButtonManagement:
 
     self.is_ready = False
     self.is_ready_prev = False
+    self.overriding = False  # Fork: driver on the accelerator
+    self.source_prev = LongitudinalPlanSource.cruise
     self.v_target_ms_last = 0.0
     self.is_metric = False
 
@@ -54,7 +59,14 @@ class IntelligentCruiseButtonManagement:
     speed_conv = CV.MS_TO_KPH if self.is_metric else CV.MS_TO_MPH
     ms_conv = CV.KPH_TO_MS if self.is_metric else CV.MPH_TO_MS
 
-    self.v_target_ms_last = apply_hysteresis(LP_SP.vTarget, self.v_target_ms_last, HYST_GAP * ms_conv)
+    vision = LP_SP.longitudinalPlanSource == LongitudinalPlanSource.sccVision
+    if vision and self.source_prev == LongitudinalPlanSource.sccVision:
+      self.v_target_ms_last = apply_hysteresis(LP_SP.vTarget, self.v_target_ms_last, VISION_HYST_GAP * ms_conv)
+    elif vision:
+      self.v_target_ms_last = LP_SP.vTarget
+    else:
+      self.v_target_ms_last = apply_hysteresis(LP_SP.vTarget, self.v_target_ms_last, HYST_GAP * ms_conv)
+    self.source_prev = LP_SP.longitudinalPlanSource
 
     self.v_target = round(self.v_target_ms_last * speed_conv)
     self.v_cruise_min = get_minimum_set_speed(self.is_metric)
@@ -78,7 +90,7 @@ class IntelligentCruiseButtonManagement:
             elif self.v_target > self.v_cruise_cluster:
               self.state = State.increasing
 
-            elif self.v_target < self.v_cruise_cluster and self.v_cruise_cluster > self.v_cruise_min:
+            elif self.v_target < self.v_cruise_cluster and self.v_cruise_cluster > self.v_cruise_min and not self.overriding:
               self.state = State.decreasing
 
         # HOLDING
@@ -93,7 +105,7 @@ class IntelligentCruiseButtonManagement:
 
         # DECELERATING
         elif self.state == State.decreasing:
-          if self.v_target >= self.v_cruise_cluster or self.v_cruise_cluster <= self.v_cruise_min:
+          if self.v_target >= self.v_cruise_cluster or self.v_cruise_cluster <= self.v_cruise_min or self.overriding:
             self.state = State.holding
 
     # INACTIVE
@@ -109,9 +121,13 @@ class IntelligentCruiseButtonManagement:
   def update_readiness(self, CS: car.CarState, CC: car.CarControl) -> None:
     update_manual_button_timers(CS, self.cruise_button_timers)
 
-    ready = CC.enabled and not CC.cruiseControl.override and not CC.cruiseControl.cancel and not CC.cruiseControl.resume
+    # Fork: keep working while the driver is on the accelerator, raising only (see update_state_machine). Stock
+    # stopped entirely, so a higher limit read while accelerating away from a town was not applied until the
+    # driver lifted, and a + press in the meantime clashed with it.
+    ready = CC.enabled and not CC.cruiseControl.cancel and not CC.cruiseControl.resume
     button_pressed = any(self.cruise_button_timers[k] > 0 for k in self.cruise_button_timers)
 
+    self.overriding = bool(CC.cruiseControl.override)
     self.is_ready = ready and not button_pressed
 
   def run(self, CS: car.CarState, CC: car.CarControl, LP_SP: custom.LongitudinalPlanSP, is_metric: bool) -> None:

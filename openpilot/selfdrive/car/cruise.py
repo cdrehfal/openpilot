@@ -19,6 +19,8 @@ IMPERIAL_INCREMENT = round(CV.MPH_TO_KPH, 1)  # round here to avoid rounding err
 ButtonEvent = car.CarState.ButtonEvent
 ButtonType = car.CarState.ButtonEvent.Type
 CRUISE_LONG_PRESS = 50
+FOLLOW_DASH_FRAMES = 100  # Fork: 1 s at 100 Hz, see _update_v_cruise_non_pcm
+FOLLOW_DASH_BUTTONS = (ButtonType.accelCruise, ButtonType.decelCruise, ButtonType.setCruise, ButtonType.resumeCruise)
 CRUISE_NEAREST_FUNC = {
   ButtonType.accelCruise: math.ceil,
   ButtonType.decelCruise: math.floor,
@@ -78,6 +80,26 @@ class VCruiseHelper(VCruiseHelperSP):
     if not enabled:
       return
 
+    # Fork: with the stock cruise still in charge of speed (button management), a driver's +/- press acts on the
+    # car's own set speed, with the car's own rules (on this Hyundai, + while on the accelerator jumps to the
+    # current speed; holding steps by 5). Working out the result here from the dash value at the moment of the
+    # press went wrong: the dash updates a moment later, openpilot kept the stale value (e.g. 40 + 1 = 41 while
+    # the car had jumped to 53) and button management then pulled the car back down to it, press after press.
+    # So after a driver press, follow the dash until it settles. A press that confirms a Speed Limit Assist
+    # prompt is left to the confirmation logic below.
+    if self.CP.pcmCruise:  # only reached with button management (pcmCruiseSpeed off)
+      for b in CS.buttonEvents:
+        if b.type.raw in FOLLOW_DASH_BUTTONS:
+          confirming = b.type.raw in self.button_timers and self.update_speed_limit_assist_pre_active_confirmed(b.type.raw)
+          self.follow_dash_frames = 0 if confirming else FOLLOW_DASH_FRAMES
+      if any(self.button_timers.values()) and self.follow_dash_frames > 0:
+        self.follow_dash_frames = FOLLOW_DASH_FRAMES  # still held
+      if self.follow_dash_frames > 0:
+        self.follow_dash_frames -= 1
+        if CS.cruiseState.speedCluster > 0:
+          self.v_cruise_kph = float(np.clip(round(CS.cruiseState.speedCluster * CV.MS_TO_KPH, 1), self.v_cruise_min, V_CRUISE_MAX))
+        return
+
     long_press = False
     button_type = None
 
@@ -113,14 +135,6 @@ class VCruiseHelper(VCruiseHelperSP):
     # False: Allow set speed changes as SLA is not requesting user confirmation
     if self.update_speed_limit_assist_pre_active_confirmed(button_type):
       return
-
-    # Fork: with the stock cruise still in charge of speed (button management), openpilot's own set speed and the
-    # number on the dash drift apart whenever button management has pulled the dash value down (curve slowing,
-    # speed limit). A driver adjusting from what the dash shows was then adjusting openpilot's higher value
-    # instead, and button management pushed the dash back up: the car "fought" the driver. Make the dash the
-    # truth for every manual press: start from the cluster's current set speed, then apply the press.
-    if self.CP.pcmCruise and CS.cruiseState.speedCluster > 0:
-      self.v_cruise_kph = round(CS.cruiseState.speedCluster * CV.MS_TO_KPH, 1)
 
     long_press, v_cruise_delta = VCruiseHelperSP.update_v_cruise_delta(self, long_press, v_cruise_delta)
     if long_press and self.v_cruise_kph % v_cruise_delta != 0:  # partial interval

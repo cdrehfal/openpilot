@@ -59,7 +59,15 @@ def setup_sm_mock(mocker):
     'carStateSP': car_state_sp,
     'gpsLocation': gps_data,
   }[key]
+  now = time.monotonic() * 1e9
+  sm_mock.logMonoTime = {'gpsLocation': now, 'gpsLocationExternal': now, 'liveMapDataSP': now}
   return sm_mock
+
+
+def prime_sign(resolver, sm_mock):
+  # Fork: these stock tests check how sources are resolved, starting from a camera reading that is already in use
+  # (a new reading is only used once plausible and held; that filter is tested in TestSignFilter)
+  resolver.sign_limit = sm_mock['carStateSP'].speedLimit
 
 
 parametrized_policies = parameterized.expand(
@@ -93,6 +101,7 @@ class TestSpeedLimitResolverValidation(OpenpilotTestCase):
     resolver = resolver_class()
     resolver.policy = policy
     sm_mock = setup_sm_mock(mocker)
+    prime_sign(resolver, sm_mock)
     source_speed_limit = sm_mock[sm_key].speedLimit
 
     # Assert the resolver
@@ -104,6 +113,7 @@ class TestSpeedLimitResolverValidation(OpenpilotTestCase):
     resolver = resolver_class()
     resolver.policy = Policy.combined
     sm_mock = setup_sm_mock(mocker)
+    prime_sign(resolver, sm_mock)
     socket_to_source = {'carStateSP': SpeedLimitSource.car, 'liveMapDataSP': SpeedLimitSource.map}
     minimum_key, minimum_speed_limit = min(
       ((key, sm_mock[key].speedLimit) for key in
@@ -119,6 +129,7 @@ class TestSpeedLimitResolverValidation(OpenpilotTestCase):
     resolver = resolver_class()
     resolver.policy = policy
     sm_mock = setup_sm_mock(mocker)
+    prime_sign(resolver, sm_mock)
     source_speed_limit = sm_mock[sm_key].speedLimit
 
     # Assert the parsing
@@ -133,6 +144,7 @@ class TestSpeedLimitResolverValidation(OpenpilotTestCase):
     resolver.policy = policy
 
     sm_mock = setup_sm_mock(mocker)
+    prime_sign(resolver, sm_mock)
     resolver.update(v_ego, sm_mock)
 
     # After resolution
@@ -191,10 +203,12 @@ class TestAnticipateLowerLimitAhead(OpenpilotTestCase):
     sm.logMonoTime = {'gpsLocation': gps, 'gpsLocationExternal': gps, 'liveMapDataSP': (_Clock.now - map_age) * 1e9}
     return sm
 
-  def _resolver(self):
+  def _resolver(self, sign=None):
     resolver = SpeedLimitResolver()
     resolver.policy = Policy.car_state_only
     resolver.is_metric = False
+    if sign is not None:
+      resolver.sign_limit = sign  # the camera's current reading is already in use
     return resolver
 
   def _drive(self, resolver, v, seconds, sm_fn):
@@ -210,7 +224,7 @@ class TestAnticipateLowerLimitAhead(OpenpilotTestCase):
   def test_ramps_in_whole_mph_toward_lower_limit(self):
     # 70 mph, map agrees, 55 mph in 200 m
     car, nxt = 70 / MPH, 55 / MPH
-    resolver = self._resolver()
+    resolver = self._resolver(car)
     resolver.update(car, self._sm(car, car, nxt, 200.))
     assert resolver.source == SpeedLimitSource.map
     ramp = (nxt ** 2 + 2 * ANTICIPATE_DECEL * 200.) ** 0.5
@@ -219,7 +233,7 @@ class TestAnticipateLowerLimitAhead(OpenpilotTestCase):
 
   def test_steps_about_twice_a_second_and_announces_once(self):
     car, nxt = 70 / MPH, 55 / MPH
-    resolver = self._resolver()
+    resolver = self._resolver(car)
     out = self._drive(resolver, 30., 8., lambda x: self._sm(car, car, nxt, max(0., 240. - x)))
     values = [round(v * MPH, 3) for v, _, _ in out]
     assert all(abs(v - round(v)) < 1e-6 for v in values)       # whole mph only
@@ -229,7 +243,7 @@ class TestAnticipateLowerLimitAhead(OpenpilotTestCase):
     assert eased and eased[0] is False and all(eased[1:])       # only the first eased step announces
 
   def test_no_ramp_when_map_disagrees_with_sign(self):
-    resolver = self._resolver()
+    resolver = self._resolver(24.6)
     resolver.update(24.6, self._sm(24.6, 20., 20.1, 167.))
     assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == 24.6
 
@@ -237,21 +251,22 @@ class TestAnticipateLowerLimitAhead(OpenpilotTestCase):
     resolver = self._resolver()
     for sm in (self._sm(24.6, 24.6, 31.3, 167.), self._sm(24.6, 24.6, 0., 0.), self._sm(24.6, 24.6, 20.1, 900.),
                self._sm(24.6, 24.6, 20.1, 167., fix_age=2 * LIMIT_MAX_MAP_DATA_AGE), self._sm(24.6, 24.6, 20.1, 167., map_age=5.)):
-      resolver = self._resolver()
+      resolver = self._resolver(24.6)
       resolver.update(24.6, sm)
       assert resolver.source == SpeedLimitSource.car, sm
 
-  def test_no_easing_below_auto_apply_floor(self):
-    # 55 -> 40: below 45 mph the driver confirms at the sign, so no easing toward it
-    resolver = self._resolver()
-    resolver.update(24.6, self._sm(55 / MPH, 55 / MPH, 40 / MPH, 100.))
+  def test_eases_toward_low_map_limits_but_not_implausible_ones(self):
+    # 55 -> 25 entering a town: map-backed, eased; a 15 ahead is not a posted road limit: not eased
+    resolver = self._resolver(55 / MPH)
+    resolver.update(24.6, self._sm(55 / MPH, 55 / MPH, 25 / MPH, 100.))
+    assert resolver.source == SpeedLimitSource.map and resolver.map_agrees
+    resolver = self._resolver(55 / MPH)
+    resolver.update(24.6, self._sm(55 / MPH, 55 / MPH, 15 / MPH, 50.))
     assert resolver.source == SpeedLimitSource.car
-    resolver.update(24.6, self._sm(55 / MPH, 55 / MPH, 45 / MPH, 100.))
-    assert resolver.source == SpeedLimitSource.map
 
   def test_holds_through_map_dropout_until_camera_reads_sign(self):
     car, nxt = 70 / MPH, 55 / MPH
-    resolver = self._resolver()
+    resolver = self._resolver(car)
     self._drive(resolver, 30., 3., lambda x: self._sm(car, car, nxt, max(0., 240. - x)))
     before = resolver.speed_limit
     assert resolver.source == SpeedLimitSource.map
@@ -260,22 +275,30 @@ class TestAnticipateLowerLimitAhead(OpenpilotTestCase):
     assert resolver.source == SpeedLimitSource.map and resolver.speed_limit <= before
     self._drive(resolver, 30., 5., lambda x: self._sm(car, nxt, 0., 0.))  # passes the sign
     assert resolver.source == SpeedLimitSource.map and round(resolver.speed_limit * MPH) == 55
-    # camera reads 55: camera wins
-    resolver.update(30., self._sm(nxt, nxt, 0., 0.))
+    # camera reads 55 (and holds it): camera wins
+    self._drive(resolver, 30., 1.2, lambda x: self._sm(nxt, nxt, 0., 0.))
     assert resolver.source == SpeedLimitSource.car and round(resolver.speed_limit * MPH) == 55
 
   def test_releases_well_past_the_sign(self):
     car, nxt = 70 / MPH, 55 / MPH
-    resolver = self._resolver()
+    resolver = self._resolver(car)
     self._drive(resolver, 30., 1., lambda x: self._sm(car, car, nxt, max(0., 100. - x)))
     self._drive(resolver, 30., 16., lambda x: self._sm(car, car, 0., 0.))  # ~480 m more, camera never reads it
     assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == car
+
+  def test_keeps_lower_limit_when_camera_missed_the_sign(self):
+    # the map now gives 55 here and the camera never read a 55 sign: keep 55 (the map said so ahead of time too)
+    car, nxt = 70 / MPH, 55 / MPH
+    resolver = self._resolver(car)
+    self._drive(resolver, 30., 1., lambda x: self._sm(car, car, nxt, max(0., 100. - x)))
+    self._drive(resolver, 30., 16., lambda x: self._sm(car, nxt, 0., 0.))
+    assert resolver.source == SpeedLimitSource.map and round(resolver.speed_limit * MPH) == 55
 
   def test_numpy_speed_publishes(self):
     # plannerd passes v_ego from a FirstOrderFilter (numpy float64). Outputs must be plain Python types, or setting
     # speedLimitValid on the capnp message raises (crashed plannerd, Sep 24).
     import numpy as np
-    resolver = self._resolver()
+    resolver = self._resolver(55 / MPH)
     resolver.update(np.float64(24.6), self._sm(55 / MPH, 55 / MPH, 45 / MPH, 100.))
     assert resolver.source == SpeedLimitSource.map
     assert type(resolver.speed_limit_valid) is bool and type(resolver.speed_limit_last_valid) is bool
@@ -287,3 +310,62 @@ class TestAnticipateLowerLimitAhead(OpenpilotTestCase):
     r.distToSpeedLimit = float(resolver.distance)
     r.source = resolver.source
     assert r.speedLimitValid
+
+
+class TestSignFilter(OpenpilotTestCase):
+  """Fork: which camera readings are used, and when; and whether the map backs them up."""
+
+  def setup_method(self):
+    import openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver as R
+    self._patch = mock.patch.object(R, 'time', _Clock)
+    self._patch.start()
+    _Clock.now = 1000.
+
+  def teardown_method(self):
+    self._patch.stop()
+
+  def _run(self, readings_mph, seconds_each=2.0, map_mph=0, ahead=(0, 0.)):
+    r = SpeedLimitResolver()
+    r.policy = Policy.car_state_only
+    r.is_metric = False
+    out = []
+    for mph in readings_mph:
+      for _ in range(int(seconds_each * 20)):
+        sm = TestAnticipateLowerLimitAhead._sm(None, mph / MPH, map_mph / MPH, ahead[0] / MPH, ahead[1])
+        r.update(25., sm)
+        _Clock.now += 0.05
+      out.append(round(r.speed_limit * MPH))
+    return r, out
+
+  def test_new_reading_used_after_it_holds(self):
+    _, out = self._run([55, 35], seconds_each=0.5)
+    assert out == [0, 0]           # neither held for a second
+    _, out = self._run([55, 35], seconds_each=1.2)
+    assert out == [55, 35]
+
+  def test_flicker_ignored(self):
+    # 35 -> 15 -> 25 -> 35 through a town: the 15 is not a posted road limit (ignored); the 25 held, so it is used
+    _, out = self._run([35, 15, 25, 35], seconds_each=1.5)
+    assert out == [35, 35, 25, 35]
+    r, out = self._run([35], seconds_each=1.5)
+    assert out == [35]
+
+  def test_implausible_readings_ignored(self):
+    for bad in (5, 10, 15, 17, 90, 120):
+      _, out = self._run([55, bad], seconds_each=1.5)
+      assert out == [55, 55], bad
+
+  def test_lost_reading_keeps_last(self):
+    _, out = self._run([55, 0], seconds_each=1.5)
+    assert out == [55, 55]
+
+  def test_map_agreement(self):
+    r, _ = self._run([35], seconds_each=1.5, map_mph=35)
+    assert r.map_agrees and not r.map_conflict
+    r, _ = self._run([35], seconds_each=1.5, map_mph=55)
+    assert r.map_conflict and not r.map_agrees
+    r, _ = self._run([35], seconds_each=1.5)
+    assert not r.map_agrees and not r.map_conflict
+    # the map's change point just ahead counts (sign read a little before the map switches)
+    r, _ = self._run([25], seconds_each=1.5, map_mph=55, ahead=(25, 40.))
+    assert r.map_agrees and not r.map_conflict

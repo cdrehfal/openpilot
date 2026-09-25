@@ -18,9 +18,3 @@ CONFIRM_SPEED_THRESHOLD = {
   False: 50,  # mph
 }
 
-# Fork: Speed Limit Assist changes the set speed by itself only for posted limits of at least this; below it,
-# it asks for a +/- tap. The map easing ahead of a lower limit uses the same floor.
-AUTO_APPLY_MIN_LIMIT = {
-  True: 70,   # km/h
-  False: 45,  # mph
-}
