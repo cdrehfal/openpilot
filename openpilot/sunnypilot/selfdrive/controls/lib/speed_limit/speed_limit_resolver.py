@@ -24,7 +24,7 @@ ALL_SOURCES = tuple(SpeedLimitSource.schema.enumerants.values())
 # sign; map data can see it coming. Map data is used for this and nothing else: only to lower the target, only
 # when the map agrees with the sign the camera has already read (so a wrong map entry can't act), and along a
 # gentle ramp that ends at the sign. The camera's reading always wins once it arrives.
-ANTICIPATE_DECEL = 0.5      # m/s^2, ramp gentleness (55 -> 35 mph starts about 360 m before the sign)
+ANTICIPATE_DECEL = 0.8      # m/s^2, a bit gentler than this driver's own ~1.0 (70 -> 55 mph starts ~230 m before the sign)
 ANTICIPATE_AGREE_TOL = 1.0  # m/s, map current limit must match the car's reading within this (~2 mph)
 ANTICIPATE_MAX_DIST = 600.  # m, ignore map limits further ahead than this
 

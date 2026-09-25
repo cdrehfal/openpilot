@@ -173,11 +173,13 @@ class TestAnticipateLowerLimitAhead(OpenpilotTestCase):
     return resolver
 
   def test_ramps_toward_lower_limit_ahead(self, mocker):
-    # 55 mph, map agrees, 40 mph in 167 m: aim for ~49 mph now, sourced to the map
+    # 55 mph, map agrees, 40 mph in 167 m: aim below 55 now along the ramp, sourced to the map
+    from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import ANTICIPATE_DECEL
     resolver = self._resolver()
     resolver.update(24.6, self._sm(mocker, 24.6, 24.6, 17.9, 167.))
     assert resolver.source == SpeedLimitSource.map
-    assert 21.5 < resolver.speed_limit < 22.5
+    expected = (17.9 ** 2 + 2 * ANTICIPATE_DECEL * (167. - 24.6 * 0.05)) ** 0.5
+    assert abs(resolver.speed_limit - expected) < 0.1 and resolver.speed_limit < 24.6
     assert abs(resolver.distance - 167. + 24.6 * 0.05) < 2.
 
   def test_no_ramp_when_map_disagrees_with_sign(self, mocker):
