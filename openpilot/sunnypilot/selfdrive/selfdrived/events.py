@@ -61,9 +61,12 @@ def _speed_limit_facts(sm: messaging.SubMaster, metric: bool) -> dict:
 
 def speed_limit_applied_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int,
                               personality) -> Alert:
-  """Fork: say what was applied: 'Speed limit 55 / set to 60', or for the map easing 'Slowing for 45 / limit ahead'."""
+  """Fork: say what was applied: 'Speed limit 55 / set to 60', for the map easing 'Slowing for 45 / limit ahead', and
+  for the early step toward a higher limit '55 ahead / set to 55'."""
   f = _speed_limit_facts(sm, metric)
-  if f['easing'] and f['ahead']:
+  if f['easing'] and f['ahead'] and f['ahead'] > f['limit']:
+    text1, text2 = f"{f['ahead']} ahead", f"set to {f['final']}"
+  elif f['easing'] and f['ahead']:
     text1, text2 = f"Slowing for {f['ahead']}", "limit ahead"
   else:
     text1, text2 = f"Speed limit {f['limit']}", f"set to {f['final']}"

@@ -73,3 +73,48 @@ class TestAnnouncements:
       sla.update_active_event(events)                     # a change to the same set speed (easing starts): announced
       sla.update_active_event(events, reactivation=True)  # resume much later: announced
     assert events.add.call_count == 3
+
+
+class TestRaiseStepAfterOverride:
+  """The early step toward a higher limit ahead never pulls a set speed the driver chose back down."""
+
+  def _sla(self):
+    from openpilot.cereal import custom
+    from opendbc.car.structs import car
+    import openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist as A
+    CP = car.CarParams.new_message(brand="hyundai", pcmCruise=True, openpilotLongitudinalControl=False).as_reader()
+    CP_SP = custom.CarParamsSP.new_message(pcmCruiseSpeed=False).as_reader()
+    from unittest import mock
+    sla = A.SpeedLimitAssist(CP, CP_SP)
+    sla.params = mock.MagicMock()
+    sla.params.get.side_effect = lambda k, **kw: A.Mode.assist if k == "SpeedLimitMode" else 0
+    sla.params.get_bool.return_value = False
+    sla.is_metric = False
+    sla.enabled = True
+    return sla, A
+
+  def _step(self, sla, limit_mph, set_mph, n=1, **kw):
+    from unittest import mock
+    ev = mock.MagicMock()
+    for _ in range(n):
+      sla.update(True, False, 20., 0., set_mph * CV.MPH_TO_MS, limit_mph * CV.MPH_TO_MS, (limit_mph + 5) * CV.MPH_TO_MS, True, 0., ev,
+                 map_agrees=True, **kw)
+    return ['disabled', 'inactive', 'preActive', 'pending', 'adapting', 'active'][int(sla.state)]
+
+  def test_driver_override_stands_through_the_raise_then_sign_applies(self):
+    sla, A = self._sla()
+    self._step(sla, 45, 50, n=20)                      # engaged on a 45, set 50
+    assert self._step(sla, 45, 50) == 'active'
+    assert self._step(sla, 45, 60) == 'inactive'       # driver went to 60
+    self._step(sla, 45, 60, n=3)
+    st = self._step(sla, 50, 60, raise_step=True)      # map: 55 ahead -> early step to 50 (+5 = 55): below the driver's 60
+    assert st == 'inactive'
+    assert self._step(sla, 50, 60, n=40, raise_step=True) == 'inactive'
+    assert self._step(sla, 55, 60) == 'active'          # the 55 sign: applied (map agrees), set 60 = 60
+
+  def test_raise_applies_when_assist_is_in_control(self):
+    sla, A = self._sla()
+    self._step(sla, 45, 50, n=20)
+    assert self._step(sla, 45, 50) == 'active'
+    assert self._step(sla, 50, 50, raise_step=True) == 'active'
+    assert round(sla.output_v_target * CV.MS_TO_MPH) == 55

@@ -15,7 +15,7 @@ from openpilot.cereal import custom
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import LIMIT_MAX_MAP_DATA_AGE
 
 from openpilot.common.constants import CV
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver, ALL_SOURCES, \
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import ANTICIPATE_LEAD, SpeedLimitResolver, ALL_SOURCES, \
   ANTICIPATE_DECEL
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Policy
 from openpilot.common.test import OpenpilotTestCase
@@ -174,9 +174,9 @@ class _Clock:
 MPH = CV.MS_TO_MPH
 
 
-class TestAnticipateLowerLimitAhead(OpenpilotTestCase):
-  """Fork: ease off toward a lower limit the map says is ahead. Ages are taken from the messages' receive times
-  (the receiver's wall-clock timestamp is what the device logs, and what stopped this from ever firing)."""
+class _AnticipateCase(OpenpilotTestCase):
+  """Fork: map-ahead anticipation. Ages are taken from the messages' receive times (the receiver's wall-clock
+  timestamp is what the device logs, and what stopped this from ever firing)."""
 
   def setup_method(self):
     import openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver as R
@@ -221,15 +221,33 @@ class TestAnticipateLowerLimitAhead(OpenpilotTestCase):
       travelled += v * 0.05
     return out
 
+
+class TestAnticipateLowerLimitAhead(_AnticipateCase):
+  """Fork: ease off toward a lower limit the map says is ahead."""
+
   def test_ramps_in_whole_mph_toward_lower_limit(self):
     # 70 mph, map agrees, 55 mph in 200 m
     car, nxt = 70 / MPH, 55 / MPH
     resolver = self._resolver(car)
     resolver.update(car, self._sm(car, car, nxt, 200.))
     assert resolver.source == SpeedLimitSource.map
-    ramp = (nxt ** 2 + 2 * ANTICIPATE_DECEL * 200.) ** 0.5
+    ramp = (nxt ** 2 + 2 * ANTICIPATE_DECEL * (200. - car * ANTICIPATE_LEAD)) ** 0.5
     assert resolver.speed_limit * MPH == math.ceil(ramp * MPH - 1e-6)
     assert type(resolver.speed_limit) is float
+
+  def test_ramp_reaches_the_new_limit_before_the_sign(self):
+    # the car lags the set speed by ~3 s: the target is at the new limit ANTICIPATE_LEAD seconds before the sign,
+    # and the ramp starts that much earlier (60 -> 30 mph from ~460 m, not ~340 m)
+    car, nxt = 60 / MPH, 30 / MPH
+    v = car
+    start = (car ** 2 - nxt ** 2) / (2 * ANTICIPATE_DECEL) + v * ANTICIPATE_LEAD
+    assert 440 < start < 480
+    resolver = self._resolver(car)
+    out = self._drive(resolver, v, start / v + 1., lambda x: self._sm(car, car, nxt, max(0., start - x)))
+    at_lead = out[int((start / v - ANTICIPATE_LEAD) * 20) + 4]  # a few frames on (whole-mph rounding is upward)
+    assert at_lead[1] == SpeedLimitSource.map and round(at_lead[0] * MPH) == 30
+    first = next(v for v, src, _ in out if src == SpeedLimitSource.map)
+    assert round(first * MPH) == 59  # starts one step below the current limit, no jump
 
   def test_steps_about_twice_a_second_and_announces_once(self):
     car, nxt = 70 / MPH, 55 / MPH
@@ -310,6 +328,74 @@ class TestAnticipateLowerLimitAhead(OpenpilotTestCase):
     r.distToSpeedLimit = float(resolver.distance)
     r.source = resolver.source
     assert r.speedLimitValid
+
+
+class TestAnticipateHigherLimitAhead(_AnticipateCase):
+  """Fork: start toward a higher limit the map says is close ahead: 5 mph above the current limit (10 over with the
+  driver's offset), from 150 m before the map's change point, held until the camera reads the sign."""
+
+  def test_steps_up_five_within_150m(self):
+    car, nxt = 45 / MPH, 55 / MPH
+    resolver = self._resolver(car)
+    resolver.update(20., self._sm(car, car, nxt, 300.))
+    assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == car  # too far yet
+    resolver.update(20., self._sm(car, car, nxt, 140.))
+    assert resolver.source == SpeedLimitSource.map and round(resolver.speed_limit * MPH) == 50
+    assert resolver.map_agrees and not resolver.map_conflict and type(resolver.speed_limit) is float
+
+  def test_never_above_the_new_limit(self):
+    # 25 -> 30 (or 55 -> 70): part-way only, never past what the sign will say
+    resolver = self._resolver(25 / MPH)
+    resolver.update(10., self._sm(25 / MPH, 25 / MPH, 30 / MPH, 100.))
+    assert round(resolver.speed_limit * MPH) == 30
+    resolver = self._resolver(55 / MPH)
+    resolver.update(25., self._sm(55 / MPH, 55 / MPH, 70 / MPH, 100.))
+    assert round(resolver.speed_limit * MPH) == 60
+
+  def test_needs_map_agreement_and_fresh_data(self):
+    car, nxt = 45 / MPH, 55 / MPH
+    for sm in (self._sm(car, 40 / MPH, nxt, 100.), self._sm(car, 0., nxt, 100.),
+               self._sm(car, car, nxt, 100., map_age=5.), self._sm(car, car, nxt, 100., fix_age=2 * LIMIT_MAX_MAP_DATA_AGE)):
+      resolver = self._resolver(car)
+      resolver.update(20., sm)
+      assert resolver.source == SpeedLimitSource.car, sm
+
+  def test_announces_once_then_quiet(self):
+    car, nxt = 45 / MPH, 55 / MPH
+    resolver = self._resolver(car)
+    out = self._drive(resolver, 20., 6., lambda x: self._sm(car, car, nxt, max(0., 120. - x)))
+    eased = [e for _, src, e in out if src == SpeedLimitSource.map]
+    assert eased and eased[0] is False and all(eased[1:])
+    assert all(round(v * MPH) == 50 for v, src, _ in out if src == SpeedLimitSource.map)
+
+  def test_holds_until_camera_reads_the_sign(self):
+    car, nxt = 45 / MPH, 55 / MPH
+    resolver = self._resolver(car)
+    self._drive(resolver, 20., 2., lambda x: self._sm(car, car, nxt, max(0., 100. - x)))
+    assert resolver.source == SpeedLimitSource.map
+    # map drops the limit ahead, then gives 55 here while the camera still says 45: keep the step
+    self._drive(resolver, 20., 1., lambda x: self._sm(car, car, 0., 0.))
+    assert resolver.source == SpeedLimitSource.map and round(resolver.speed_limit * MPH) == 50
+    self._drive(resolver, 20., 8., lambda x: self._sm(car, nxt, 0., 0.))
+    assert resolver.source == SpeedLimitSource.map and round(resolver.speed_limit * MPH) == 50
+    # camera reads 55: the sign wins, the full limit applies
+    self._drive(resolver, 20., 1.2, lambda x: self._sm(nxt, nxt, 0., 0.))
+    assert resolver.source == SpeedLimitSource.car and round(resolver.speed_limit * MPH) == 55
+
+  def test_releases_well_past_the_sign_when_map_does_not_confirm(self):
+    car, nxt = 45 / MPH, 55 / MPH
+    resolver = self._resolver(car)
+    self._drive(resolver, 20., 1., lambda x: self._sm(car, car, nxt, max(0., 60. - x)))
+    assert resolver.source == SpeedLimitSource.map
+    self._drive(resolver, 20., 20., lambda x: self._sm(car, car, 0., 0.))  # 400 m on, map says 45 here, camera 45
+    assert resolver.source == SpeedLimitSource.car and resolver.speed_limit == car
+
+  def test_lower_limit_ahead_takes_priority(self):
+    # a lower limit is eased toward; a higher one is not stepped up to while easing
+    car = 55 / MPH
+    resolver = self._resolver(car)
+    resolver.update(24., self._sm(car, car, 25 / MPH, 100.))
+    assert resolver.source == SpeedLimitSource.map and resolver.speed_limit < car
 
 
 class TestSignFilter(OpenpilotTestCase):

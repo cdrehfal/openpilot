@@ -99,6 +99,7 @@ class SpeedLimitAssist:
     self._state_prev = SpeedLimitAssistState.disabled
     self.pcm_op_long = CP.openpilotLongitudinalControl and CP.pcmCruise
     self._quiet_change = False
+    self._raise_step = False  # Fork: the target is the early step toward a higher limit ahead
     self._map_agrees = False
     self._map_conflict = False
     self._sign_prev = 0.
@@ -370,8 +371,9 @@ class SpeedLimitAssist:
           if self.v_cruise_cluster_changed:
             self._unconfirmed = False  # the driver set a speed: that's the answer
           # Fork: after the driver overrode the set speed, the map easing's 1 mph steps don't ask to be
-          # confirmed; the next sign the camera reads is applied or asked about like any other.
-          if self.speed_limit_changed and not self._quiet_change:
+          # confirmed; the next sign the camera reads is applied or asked about like any other. The early step
+          # toward a higher limit is left alone too: the driver's own set speed stands until the sign.
+          if self.speed_limit_changed and not self._quiet_change and not self._raise_step:
             if self.apply_confirm_speed_threshold:
               self.state = SpeedLimitAssistState.preActive
               self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[self.pcm_op_long] / DT_MDL)
@@ -379,7 +381,7 @@ class SpeedLimitAssist:
               self.state = SpeedLimitAssistState.active
           # Fork: an unanswered limit is applied once the map backs it up (e.g. a freeway limit read on the on-ramp,
           # before the map has the car on the freeway)
-          elif self._unconfirmed and not self.apply_confirm_speed_threshold:
+          elif self._unconfirmed and not self.apply_confirm_speed_threshold and not self._raise_step:
             self.state = SpeedLimitAssistState.active
           elif self._update_non_pcm_long_confirmed_state():
             self.state = SpeedLimitAssistState.active
@@ -432,9 +434,11 @@ class SpeedLimitAssist:
 
   def update(self, long_enabled: bool, long_override: bool, v_ego: float, a_ego: float, v_cruise_cluster: float, speed_limit: float,
              speed_limit_final_last: float, has_speed_limit: bool, distance: float, events_sp: EventsSP,
-             quiet_change: bool = False, map_agrees: bool = False, map_conflict: bool = False, sign_prev: float = 0.) -> None:
+             quiet_change: bool = False, map_agrees: bool = False, map_conflict: bool = False, sign_prev: float = 0.,
+             raise_step: bool = False) -> None:
     self.long_enabled = long_enabled
     self._quiet_change = quiet_change
+    self._raise_step = raise_step
     self._map_agrees = map_agrees
     self._map_conflict = map_conflict
     self._sign_prev = sign_prev

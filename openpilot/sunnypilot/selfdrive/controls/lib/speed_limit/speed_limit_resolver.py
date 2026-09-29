@@ -25,11 +25,22 @@ ALL_SOURCES = tuple(SpeedLimitSource.schema.enumerants.values())
 # sign; map data can see it coming. Map data is used for this and nothing else: only to lower the target, only
 # when the map agrees with the sign the camera has already read (so a wrong map entry can't act), and along a
 # gentle ramp that ends at the sign. The camera's reading always wins once it arrives.
-ANTICIPATE_DECEL = 0.8      # m/s^2, a bit gentler than this driver's own ~1.0 (70 -> 55 mph starts ~230 m before the sign)
+ANTICIPATE_DECEL = 0.7      # m/s^2 of the set-speed ramp (this driver's own slowdowns are ~1.0)
+# The car's cruise follows a falling set speed with a lag: on Sep 29 it took ~3 s to build up any deceleration and
+# then ran ~6 mph behind the set speed, so it reached the sign 7 mph above the new limit (WI 30, 70 -> 55) and the
+# driver had to brake for 55 -> 25 (Hwy 19). The ramp therefore runs this far ahead of the car: the set speed reaches
+# the new limit ANTICIPATE_LEAD seconds before the sign, so the car gets there at about the sign.
+ANTICIPATE_LEAD = 3.0       # s (60 -> 30 mph now starts ~460 m before the sign, 75 -> 60 ~390 m)
 ANTICIPATE_AGREE_TOL = 1.0  # m/s, map current limit must match the car's reading within this (~2 mph)
 ANTICIPATE_MAX_DIST = 600.  # m, ignore map limits further ahead than this
 ANTICIPATE_HOLD_PAST = 300.  # m, keep the lowered target this far past the sign while the camera hasn't read it yet
 MAP_MSG_MAX_AGE = 3.  # s, mapd publishes once a second
+# Fork: and start toward a higher limit the map says is close ahead, so the car isn't held at the old limit until
+# the camera reads the sign. Same guard as the easing (map must agree with the current sign), a short distance only,
+# and only part of the way: the target goes RAISE_STEP above the current limit (with the driver's offset on top,
+# that is the set speed 10 over the limit still in force), the rest comes when the camera reads the sign.
+RAISE_AHEAD_DIST = 150.  # m
+RAISE_STEP = {True: 8., False: 5.}  # km/h, mph above the current limit
 
 # Fork: the car's camera reads more signs than the map knows about, but it also misreads (advisory and school
 # signs, signs on side roads and ramps, a flicker between two readings). A new camera reading is used only once
@@ -95,10 +106,12 @@ class SpeedLimitResolver:
     self.speed_limit_last = 0.
     self.v_ego = 0.
     self.easing_step = False  # this frame's change is a step of the map easing (not a new sign)
+    self.raising = False  # the target is the early step toward a higher limit ahead (not a sign)
     self._odometer = 0.
     self._last_update_t: float | None = None
     self._ease: tuple[float, float, float] | None = None  # (lower limit, car limit it started from, sign odometer)
     self._ease_floor: tuple[tuple[float, float], float] | None = None  # lowest eased target so far in this easing
+    self._raise: tuple[float, float, float] | None = None  # (higher limit, car limit it started from, sign odometer)
     # camera reading filter
     self.sign_limit = 0.  # the camera limit in use (m/s)
     self.sign_limit_prev = 0.  # the one before it
@@ -250,16 +263,24 @@ class SpeedLimitResolver:
     speed_limit = self.limit_solutions[source] if source else 0.
     distance = self.distance_solutions[source] if source else 0.
 
-    eased = False
+    eased = raising = False
     if source == SpeedLimitSource.car:
       anticipated, dist_ahead = self._anticipate_lower_limit_ahead(sm, speed_limit)
       if 0. < anticipated < speed_limit:
         speed_limit, distance, source, eased = anticipated, dist_ahead, SpeedLimitSource.map, True
+        self._raise = None
+      else:
+        raised, dist_ahead = self._anticipate_higher_limit_ahead(sm, speed_limit)
+        if raised > speed_limit:
+          speed_limit, distance, source, eased = raised, dist_ahead, SpeedLimitSource.map, True
+          raising = True
     else:
       self._ease = None
+      self._raise = None
     if self._ease is None:
       self._ease_floor = None
     self.easing_step = eased and self.source == SpeedLimitSource.map  # a continuing easing, not its first step
+    self.raising = raising
 
     return speed_limit, distance, source
 
@@ -297,9 +318,10 @@ class SpeedLimitResolver:
     else:
       return 0., 0.
 
-    # speed that reaches next_limit exactly at the sign with a constant, gentle deceleration, rounded up to a
-    # whole unit so it steps down about twice a second instead of changing every frame
-    ramp = (next_limit ** 2 + 2. * ANTICIPATE_DECEL * dist_ahead) ** 0.5
+    # speed that reaches next_limit with a constant, gentle deceleration ANTICIPATE_LEAD seconds before the sign
+    # (the car follows the set speed with about that much lag), rounded up to a whole unit so it steps down about
+    # twice a second instead of changing every frame
+    ramp = (next_limit ** 2 + 2. * ANTICIPATE_DECEL * max(0., dist_ahead - self.v_ego * ANTICIPATE_LEAD)) ** 0.5
     ramp = math.ceil(ramp * conv - 1e-6) / conv
     # only ever down within one easing: a map update that puts the sign a little farther than estimated (the map
     # comes once a second) must not step the target back up, which read as a new change
@@ -311,8 +333,35 @@ class SpeedLimitResolver:
     # speed_limit_valid a numpy.bool, which capnp refuses when plannerd publishes (crashed plannerd, Sep 24)
     return float(min(ramp, car_limit)), float(dist_ahead)
 
-  def _map_limit_ahead(self, sm: messaging.SubMaster, car_limit: float) -> tuple[float, float] | None:
-    """(lower limit, metres to it) from the map when the map agrees with the camera's current limit, else None."""
+  def _anticipate_higher_limit_ahead(self, sm: messaging.SubMaster, car_limit: float) -> tuple[float, float]:
+    """A target part-way up toward a higher limit the map says is close ahead, or (0, 0) when not applicable.
+
+    Held once started, like the easing: through map dropouts, and past the sign while the map gives the higher
+    limit here (the camera missed the sign); let go once the camera reads any new limit, or well past the sign.
+    """
+    conv = CV.MS_TO_KPH if self.is_metric else CV.MS_TO_MPH
+    # the camera read something new: it wins
+    if self._raise is not None and abs(self._raise[1] - car_limit) > ANTICIPATE_AGREE_TOL:
+      self._raise = None
+
+    found = self._map_limit_ahead(sm, car_limit, lower=False)
+    if found is not None and found[1] <= RAISE_AHEAD_DIST:
+      next_limit, dist_ahead = found
+      self._raise = (next_limit, car_limit, self._odometer + dist_ahead)
+    elif self._raise is not None:
+      next_limit, _, sign_at = self._raise
+      dist_ahead = max(0., sign_at - self._odometer)
+      map_still_says_it = abs(self.map_limit - next_limit) <= MAP_AGREE_TOL
+      if self._odometer - sign_at > ANTICIPATE_HOLD_PAST and not map_still_says_it:
+        self._raise = None
+        return 0., 0.
+    else:
+      return 0., 0.
+    return float(min(car_limit + RAISE_STEP[self.is_metric] / conv, next_limit)), float(dist_ahead)
+
+  def _map_limit_ahead(self, sm: messaging.SubMaster, car_limit: float, lower: bool = True) -> tuple[float, float] | None:
+    """(limit ahead, metres to it) from the map when the map agrees with the camera's current limit and the limit
+    ahead is lower (or, with lower=False, higher), else None."""
     map_data = sm['liveMapDataSP']
     if car_limit <= 0. or not map_data.speedLimitValid or not map_data.speedLimitAheadValid:
       return None
@@ -328,7 +377,7 @@ class SpeedLimitResolver:
     if abs(map_data.speedLimit - car_limit) > ANTICIPATE_AGREE_TOL:
       return None
     next_limit = map_data.speedLimitAhead
-    if not 0. < next_limit < car_limit:
+    if next_limit <= 0. or (next_limit < car_limit) != lower or next_limit == car_limit:
       return None
     # the distance was measured when the map message was made
     dist_ahead = max(0., map_data.speedLimitAheadDistance - self.v_ego * map_age)

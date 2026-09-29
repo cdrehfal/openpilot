@@ -43,6 +43,11 @@ class TestSpeedLimitMessages:
     s, cs = sm(64, 69, source=Source.map, map_here=70, ahead=55)
     assert texts(ev.speed_limit_applied_alert(CP, cs, s, False, 0, None)) == ("Slowing for 55", "limit ahead")
 
+  def test_applied_early_raise(self):
+    # 45 with 55 ahead: the target went to 50 (set 55) before the sign
+    s, cs = sm(50, 55, source=Source.map, map_here=45, ahead=55)
+    assert texts(ev.speed_limit_applied_alert(CP, cs, s, False, 0, None)) == ("55 ahead", "set to 55")
+
   def test_asking(self):
     s, cs = sm(35, 40, set_mph=60)
     assert texts(ev.speed_limit_pre_active_alert(CP, cs, s, False, 0, None)) == ("Speed limit 35?", "tap - to set 40")
