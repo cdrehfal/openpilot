@@ -32,6 +32,11 @@ if HARDWARE.get_device_type() == "tizi":
   AMBIENT_DB = 30
   VOLUME_BASE = 10
 
+# Fork: the volume follows cabin noise, scaled for a car that is 30-60 dB inside. This EV reads 34-40 dB (weighted)
+# at 45-70 mph, so the automatic volume sat at 16-25 % of maximum on every drive. Count the cabin as this much louder
+# than the mic hears: about twice the output at the same noise, full volume from ~46 dB instead of ~56.
+CABIN_DB_OFFSET = 10.
+
 AudibleAlert = log.SelfdriveState.AudibleAlert
 AudibleAlertSP = custom.SelfdriveStateSP.AudibleAlert
 
@@ -165,7 +170,7 @@ class Soundd(QuietMode):
       self.selfdrive_timeout_alert = False
 
   def calculate_volume(self, weighted_db):
-    volume = ((weighted_db - AMBIENT_DB) / DB_SCALE) * (MAX_VOLUME - MIN_VOLUME) + MIN_VOLUME
+    volume = ((weighted_db + CABIN_DB_OFFSET - AMBIENT_DB) / DB_SCALE) * (MAX_VOLUME - MIN_VOLUME) + MIN_VOLUME
     return math.pow(VOLUME_BASE, (np.clip(volume, MIN_VOLUME, MAX_VOLUME) - 1))
 
   @retry(attempts=10, delay=3)
