@@ -469,9 +469,12 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
 
   # Unused
 
+  # Fork: say what it is and what to do. locationd stops trusting its inputs for a while after the gyro and the
+  # camera disagree (this device's gyro has a large offset that is re-learned after every boot, so this shows up
+  # after a cold boot while already moving); it clears by itself in about a minute, a restart only starts over.
   EventName.locationdTemporaryError: {
-    ET.NO_ENTRY: NoEntryAlert("locationd Temporary Error"),
-    ET.SOFT_DISABLE: soft_disable_alert("locationd Temporary Error"),
+    ET.NO_ENTRY: NoEntryAlert("Motion sensors settling", "clears by itself in about a minute"),
+    ET.SOFT_DISABLE: soft_disable_alert("Motion sensors settling"),
   },
 
   EventName.locationdPermanentError: {
