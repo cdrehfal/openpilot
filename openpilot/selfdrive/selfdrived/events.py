@@ -469,12 +469,15 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
 
   # Unused
 
-  # Fork: say what it is and what to do. locationd stops trusting its inputs for a while after the gyro and the
-  # camera disagree (this device's gyro has a large offset that is re-learned after every boot, so this shows up
-  # after a cold boot while already moving); it clears by itself in about a minute, a restart only starts over.
+  # Fork: say what it is, and say it on screen the whole time it applies, not only when the driver presses the
+  # button. locationd stops trusting its inputs for a while after the gyro and the camera disagree (this device's
+  # gyro has a large offset that is re-learned after every boot, so this shows up after a cold boot while already
+  # moving); it clears by itself in about a minute, a restart only starts over. The standing message waits 2 s so
+  # the sub-second blip at every start doesn't flash it.
   EventName.locationdTemporaryError: {
-    ET.NO_ENTRY: NoEntryAlert("Motion sensors settling", "clears by itself in about a minute"),
-    ET.SOFT_DISABLE: soft_disable_alert("Motion sensors settling"),
+    ET.PERMANENT: NormalPermanentAlert("Motion sensors calibrating", "please wait to use sunnypilot", creation_delay=2.),
+    ET.NO_ENTRY: NoEntryAlert("Motion sensors calibrating", "please wait to use sunnypilot"),
+    ET.SOFT_DISABLE: soft_disable_alert("Motion sensors calibrating"),
   },
 
   EventName.locationdPermanentError: {
