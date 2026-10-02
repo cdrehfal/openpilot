@@ -40,6 +40,8 @@ MAP_MSG_MAX_AGE = 3.  # s, mapd publishes once a second
 # and only part of the way: the target goes RAISE_STEP above the current limit (with the driver's offset on top,
 # that is the set speed 10 over the limit still in force), the rest comes when the camera reads the sign.
 RAISE_AHEAD_DIST = 150.  # m
+# The sign that confirms a limit the easing or the early step was already heading for is not news: no second chime.
+EXPECTED_SIGN_TIME = 60.  # s after the anticipation ended in which the camera reading of that limit counts as expected
 RAISE_STEP = {True: 8., False: 5.}  # km/h, mph above the current limit
 
 # Fork: the car's camera reads more signs than the map knows about, but it also misreads (advisory and school
@@ -107,6 +109,8 @@ class SpeedLimitResolver:
     self.v_ego = 0.
     self.easing_step = False  # this frame's change is a step of the map easing (not a new sign)
     self.raising = False  # the target is the early step toward a higher limit ahead (not a sign)
+    self.sign_expected = False  # the camera read the limit the easing / early step was heading for
+    self._expected: tuple[float, float] | None = None  # (that limit, time the anticipation ended)
     self._odometer = 0.
     self._last_update_t: float | None = None
     self._ease: tuple[float, float, float] | None = None  # (lower limit, car limit it started from, sign odometer)
@@ -281,6 +285,9 @@ class SpeedLimitResolver:
       self._ease_floor = None
     self.easing_step = eased and self.source == SpeedLimitSource.map  # a continuing easing, not its first step
     self.raising = raising
+    self.sign_expected = (source == SpeedLimitSource.car and self._expected is not None
+                          and abs(speed_limit - self._expected[0]) <= ANTICIPATE_AGREE_TOL
+                          and time.monotonic() - self._expected[1] <= EXPECTED_SIGN_TIME)
 
     return speed_limit, distance, source
 
@@ -297,6 +304,7 @@ class SpeedLimitResolver:
 
     # the camera read something new: it wins
     if self._ease is not None and abs(self._ease[1] - car_limit) > ANTICIPATE_AGREE_TOL:
+      self._expected = (self._ease[0], time.monotonic())
       self._ease = None
 
     found = self._map_limit_ahead(sm, car_limit)
@@ -342,6 +350,7 @@ class SpeedLimitResolver:
     conv = CV.MS_TO_KPH if self.is_metric else CV.MS_TO_MPH
     # the camera read something new: it wins
     if self._raise is not None and abs(self._raise[1] - car_limit) > ANTICIPATE_AGREE_TOL:
+      self._expected = (self._raise[0], time.monotonic())
       self._raise = None
 
     found = self._map_limit_ahead(sm, car_limit, lower=False)

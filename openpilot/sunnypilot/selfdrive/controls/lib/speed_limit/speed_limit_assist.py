@@ -100,6 +100,7 @@ class SpeedLimitAssist:
     self.pcm_op_long = CP.openpilotLongitudinalControl and CP.pcmCruise
     self._quiet_change = False
     self._raise_step = False  # Fork: the target is the early step toward a higher limit ahead
+    self._sign_expected = False  # Fork: the sign confirms what the easing / early step was heading for: no announcement
     self._map_agrees = False
     self._map_conflict = False
     self._sign_prev = 0.
@@ -425,7 +426,11 @@ class SpeedLimitAssist:
 
       # only notify if we acquire a valid speed limit
       # do not check has_speed_limit here
-      # Fork: not on each 1 mph step of the map easing (it announced itself once when it started)
+      # Fork: not on each 1 mph step of the map easing (it announced itself once when it started), and not for the
+      # sign that confirms the limit the easing or the early step was already heading for
+      elif self._speed_limit != self.speed_limit_prev and self._sign_expected:
+        # counts as announced (the easing / early step said it), so a cruise resume soon after doesn't repeat it
+        self._last_announced = (self.speed_limit_final_last_conv, time.monotonic())
       elif self._speed_limit != self.speed_limit_prev and not quiet:
         if self.speed_limit_prev <= 0:
           self.update_active_event(events_sp)
@@ -435,10 +440,11 @@ class SpeedLimitAssist:
   def update(self, long_enabled: bool, long_override: bool, v_ego: float, a_ego: float, v_cruise_cluster: float, speed_limit: float,
              speed_limit_final_last: float, has_speed_limit: bool, distance: float, events_sp: EventsSP,
              quiet_change: bool = False, map_agrees: bool = False, map_conflict: bool = False, sign_prev: float = 0.,
-             raise_step: bool = False) -> None:
+             raise_step: bool = False, sign_expected: bool = False) -> None:
     self.long_enabled = long_enabled
     self._quiet_change = quiet_change
     self._raise_step = raise_step
+    self._sign_expected = sign_expected
     self._map_agrees = map_agrees
     self._map_conflict = map_conflict
     self._sign_prev = sign_prev

@@ -63,7 +63,7 @@ class LongitudinalPlannerSP:
                     self.resolver.speed_limit_final_last, has_speed_limit, self.resolver.distance, self.events_sp,
                     quiet_change=self.resolver.easing_step, map_agrees=self.resolver.map_agrees,
                     map_conflict=self.resolver.map_conflict, sign_prev=self.resolver.sign_limit_prev,
-                    raise_step=self.resolver.raising)
+                    raise_step=self.resolver.raising, sign_expected=self.resolver.sign_expected)
 
     targets = {
       LongitudinalPlanSource.cruise: (v_cruise, a_ego),

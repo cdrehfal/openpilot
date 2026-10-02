@@ -330,6 +330,42 @@ class TestAnticipateLowerLimitAhead(_AnticipateCase):
     assert r.speedLimitValid
 
 
+class TestExpectedSign(_AnticipateCase):
+  """Fork: the sign that confirms the limit an easing or early step was heading for is expected (no second chime);
+  any other sign is news."""
+
+  def test_sign_confirming_the_easing_is_expected(self):
+    car, nxt = 70 / MPH, 55 / MPH
+    resolver = self._resolver(car)
+    self._drive(resolver, 30., 3., lambda x: self._sm(car, car, nxt, max(0., 240. - x)))
+    assert resolver.source == SpeedLimitSource.map and not resolver.sign_expected
+    self._drive(resolver, 30., 1.2, lambda x: self._sm(nxt, nxt, 0., 0.))  # camera reads the 55
+    assert resolver.source == SpeedLimitSource.car and resolver.sign_expected
+
+  def test_a_different_sign_is_news(self):
+    car, nxt = 70 / MPH, 55 / MPH
+    resolver = self._resolver(car)
+    self._drive(resolver, 30., 3., lambda x: self._sm(car, car, nxt, max(0., 240. - x)))
+    self._drive(resolver, 30., 1.2, lambda x: self._sm(45 / MPH, 45 / MPH, 0., 0.))  # sign says 45, not 55
+    assert resolver.source == SpeedLimitSource.car and not resolver.sign_expected
+
+  def test_sign_confirming_the_early_step_is_expected_then_expires(self):
+    car, nxt = 45 / MPH, 55 / MPH
+    resolver = self._resolver(car)
+    self._drive(resolver, 20., 2., lambda x: self._sm(car, car, nxt, max(0., 100. - x)))
+    assert resolver.source == SpeedLimitSource.map
+    self._drive(resolver, 20., 1.2, lambda x: self._sm(nxt, nxt, 0., 0.))
+    assert resolver.sign_expected
+    _Clock.now += 70.
+    resolver.update(20., self._sm(nxt, nxt, 0., 0.))
+    assert not resolver.sign_expected
+
+  def test_plain_sign_without_anticipation_is_news(self):
+    resolver = self._resolver(55 / MPH)
+    self._drive(resolver, 20., 1.2, lambda x: self._sm(45 / MPH, 45 / MPH, 0., 0.))
+    assert not resolver.sign_expected
+
+
 class TestAnticipateHigherLimitAhead(_AnticipateCase):
   """Fork: start toward a higher limit the map says is close ahead: 5 mph above the current limit (10 over with the
   driver's offset), from 150 m before the map's change point, held until the camera reads the sign."""

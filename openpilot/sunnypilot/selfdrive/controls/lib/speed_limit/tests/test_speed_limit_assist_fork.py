@@ -118,3 +118,21 @@ class TestRaiseStepAfterOverride:
     assert self._step(sla, 45, 50) == 'active'
     assert self._step(sla, 50, 50, raise_step=True) == 'active'
     assert round(sla.output_v_target * CV.MS_TO_MPH) == 55
+
+
+class TestExpectedSignIsQuiet:
+  def test_no_announcement_for_the_expected_sign_but_set_speed_follows(self):
+    t = TestRaiseStepAfterOverride()
+    sla, A = t._sla()
+    from unittest import mock
+    t._step(sla, 55, 60, n=20)
+    assert t._step(sla, 55, 60) == 'active'
+    ev = mock.MagicMock()
+    # easing step 54 (quiet), then the camera's 50 that the easing was heading for: no event, target still moves
+    sla.update(True, False, 20., 0., 60 * CV.MPH_TO_MS, 54 * CV.MPH_TO_MS, 59 * CV.MPH_TO_MS, True, 0., ev, map_agrees=True, quiet_change=True)
+    sla.update(True, False, 20., 0., 60 * CV.MPH_TO_MS, 50 * CV.MPH_TO_MS, 55 * CV.MPH_TO_MS, True, 0., ev, map_agrees=True, sign_expected=True)
+    assert ev.add.call_count == 0
+    assert round(sla.output_v_target * CV.MS_TO_MPH) == 55
+    # a sign that was not anticipated still announces
+    sla.update(True, False, 20., 0., 60 * CV.MPH_TO_MS, 35 * CV.MPH_TO_MS, 40 * CV.MPH_TO_MS, True, 0., ev, map_agrees=True)
+    assert ev.add.call_count == 1
