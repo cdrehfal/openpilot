@@ -492,7 +492,9 @@ class SelfdriveD(CruiseHelper):
     # Check for FCW
     stock_long_is_braking = self.enabled and not self.CP.openpilotLongitudinalControl and CS.aEgo < -1.25
     model_fcw = self.sm['modelV2'].meta.hardBrakePredicted and not CS.brakePressed and not stock_long_is_braking
-    planner_fcw = self.sm['longitudinalPlan'].fcw and self.enabled
+    # Without openpilot longitudinal the planner's braking plan is hypothetical: don't warn while the
+    # car's own cruise is already braking firmly, the same rule the model FCW uses above.
+    planner_fcw = self.sm['longitudinalPlan'].fcw and self.enabled and not stock_long_is_braking
     if (planner_fcw or model_fcw) and not self.CP.notCar:
       self.events.add(EventName.fcw)
 
