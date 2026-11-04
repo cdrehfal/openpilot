@@ -475,9 +475,9 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   # moving); it clears by itself in about a minute, a restart only starts over. The standing message waits 2 s so
   # the sub-second blip at every start doesn't flash it.
   EventName.locationdTemporaryError: {
-    ET.PERMANENT: NormalPermanentAlert("Motion sensors calibrating", "please wait to use sunnypilot", creation_delay=2.),
-    ET.NO_ENTRY: NoEntryAlert("Motion sensors calibrating", "please wait to use sunnypilot"),
-    ET.SOFT_DISABLE: soft_disable_alert("Motion sensors calibrating"),
+    ET.PERMANENT: NormalPermanentAlert("Calibrating", "wait to engage", creation_delay=2.),
+    ET.NO_ENTRY: NoEntryAlert("Calibrating", "wait to engage"),
+    ET.SOFT_DISABLE: soft_disable_alert("Calibrating"),
   },
 
   EventName.locationdPermanentError: {

@@ -63,7 +63,8 @@ class LongitudinalPlannerSP:
                     self.resolver.speed_limit_final_last, has_speed_limit, self.resolver.distance, self.events_sp,
                     quiet_change=self.resolver.easing_step, map_agrees=self.resolver.map_agrees,
                     map_conflict=self.resolver.map_conflict, sign_prev=self.resolver.sign_limit_prev,
-                    raise_step=self.resolver.raising, sign_expected=self.resolver.sign_expected)
+                    raise_step=self.resolver.raising, sign_expected=self.resolver.sign_expected,
+                    ahead_limit=self.resolver.ahead_limit)
 
     targets = {
       LongitudinalPlanSource.cruise: (v_cruise, a_ego),
@@ -135,6 +136,12 @@ class LongitudinalPlannerSP:
     assist.active = self.sla.is_active
     assist.vTarget = float(self.sla.output_v_target)
     assist.aTarget = float(self.sla.output_a_target)
+    msg = self.sla.message
+    assist.message.kind = msg.kind
+    assist.message.limit = float(msg.limit)
+    assist.message.target = float(msg.target)
+    assist.message.direction = int(msg.direction)
+    assist.message.silent = bool(msg.silent)
 
     # E2E Alerts
     e2eAlerts = longitudinalPlanSP.e2eAlerts

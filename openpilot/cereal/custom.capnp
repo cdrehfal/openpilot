@@ -277,6 +277,23 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
       active @2 :Bool;
       vTarget @3 :Float32;
       aTarget @4 :Float32;
+      message @5 :Message;  # Fork: what the latest speed-limit pop-up says
+    }
+
+    # Fork: decided by Speed Limit Assist when it announces a limit, so the pop-up says what it is doing
+    struct Message {
+      kind @0 :MessageKind;
+      limit @1 :Float32;      # m/s: the sign's limit, or the limit ahead
+      target @2 :Float32;     # m/s: the set speed it goes to
+      direction @3 :Int8;     # -1 the car slows, +1 it speeds up, 0 the set speed changes but not the car's speed
+      silent @4 :Bool;        # replaces a pop-up shown moments ago, or confirms what one already said: no chime
+    }
+
+    enum MessageKind {
+      none @0;
+      sign @1;          # a new limit here
+      lowerAhead @2;    # the map easing toward a lower limit ahead
+      higherAhead @3;   # the early step toward a higher limit ahead
     }
 
     enum Source {

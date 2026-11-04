@@ -5,6 +5,7 @@ This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
 import time
+from dataclasses import dataclass
 
 from openpilot.cereal import custom
 from opendbc.car.structs import car
@@ -23,6 +24,7 @@ ButtonType = car.CarState.ButtonEvent.Type
 EventNameSP = custom.OnroadEventSP.EventName
 SpeedLimitAssistState = custom.LongitudinalPlanSP.SpeedLimit.AssistState
 SpeedLimitSource = custom.LongitudinalPlanSP.SpeedLimit.Source
+MessageKind = custom.LongitudinalPlanSP.SpeedLimit.MessageKind
 
 ACTIVE_STATES = (SpeedLimitAssistState.active, SpeedLimitAssistState.adapting)
 ENABLED_STATES = (SpeedLimitAssistState.preActive, SpeedLimitAssistState.pending, *ACTIVE_STATES)
@@ -54,6 +56,22 @@ CRUISE_BUTTON_CONFIRM_HOLD = 0.5  # secs.
 HIGHWAY_LIMIT = {True: 90, False: 55}   # km/h, mph
 REPEAT_ANNOUNCE_QUIET = 120.  # s, the same limit isn't announced again within this
 ARTERIAL_LIMIT = {True: 70, False: 45}  # km/h, mph
+
+# Fork (v34): what the pop-up says is decided here, from what Speed Limit Assist is doing, not re-guessed in the UI
+# from the map data (which said 'Slowing for 55' on a 50 -> 55 early step, and 'set to 50' on its way to 60).
+ANNOUNCE_REPLACE_TIME = 3.  # s: a pop-up this soon after the previous one replaces it without a second chime
+SLOWING_MARGIN = 0.5        # m/s (~1 mph): 'slowing' only when the target is below the car's speed by this much
+ANNOUNCE_DEFER_MAX = 30.    # s: the easing's pop-up waits at most this long for the car to start slowing
+V_CRUISE_VALID_MAX = 70.    # m/s: above this the cluster set speed is unset (255 km/h)
+
+
+@dataclass
+class SpeedLimitMessage:
+  kind: int = MessageKind.none
+  limit: float = 0.      # m/s
+  target: float = 0.     # m/s
+  direction: int = 0     # -1 slowing, +1 speeding up, 0 the set speed changes but the car's speed doesn't
+  silent: bool = False
 
 
 class SpeedLimitAssist:
@@ -106,6 +124,11 @@ class SpeedLimitAssist:
     self._sign_prev = 0.
     self._unconfirmed = False  # Fork: a limit that was asked about and not answered
     self._last_announced: tuple[int, float] | None = None
+    self._ahead_limit = 0.
+    self._limit_last = 0.
+    self.message = SpeedLimitMessage()
+    self._message_time = -1e9
+    self._deferred: float | None = None  # time an easing pop-up became due, while waiting for the car to slow
 
     self._plus_hold = 0.
     self._minus_hold = 0.
@@ -144,6 +167,53 @@ class SpeedLimitAssist:
     if reactivation and self._last_announced is not None and self._last_announced[0] == self.speed_limit_final_last_conv and \
        now - self._last_announced[1] < REPEAT_ANNOUNCE_QUIET:
       return
+    # Fork (v34): nor when the set speed is already where it goes: nothing changes, so nothing to say
+    if reactivation and self.v_cruise_cluster_conv == self.speed_limit_final_last_conv:
+      self._last_announced = (self.speed_limit_final_last_conv, now)
+      return
+    message = self._compose_message()
+    # Fork (v34): a limit ahead that changes nothing yet (the set speed is already there) isn't worth a pop-up
+    if message.kind != MessageKind.sign and message.direction == 0 and \
+       round(message.target * (CV.MS_TO_KPH if self.is_metric else CV.MS_TO_MPH)) == self.v_cruise_cluster_conv:
+      self._last_announced = (self.speed_limit_final_last_conv, now)
+      return
+    # Fork (v34): the easing toward a lower limit ahead starts from the set speed, which can be well above the car's
+    # speed (Nov 3: 'Slowing for 25' and 8 s more at 47 mph). Say it when the car actually starts to slow.
+    if message.kind == MessageKind.lowerAhead and self._speed_limit_final_last > self.v_ego + SLOWING_MARGIN:
+      if self._deferred is None:
+        self._deferred = now
+      return
+    self._announce(events_sp, message, now)
+
+  def _compose_message(self, silent: bool = False) -> SpeedLimitMessage:
+    """Fork (v34): what the pop-up says: the limit (here or ahead), the set speed it goes to, and whether that
+    slows the car down, speeds it up, or only changes the set speed."""
+    speed_conv = CV.MS_TO_KPH if self.is_metric else CV.MS_TO_MPH
+    limit_here = self._speed_limit if self._speed_limit > 0. else self._limit_last
+    offset = self._speed_limit_final_last - limit_here if limit_here > 0. else 0.
+    if self._ahead_limit > 0. and self._raise_step:
+      kind, limit, target = MessageKind.higherAhead, self._ahead_limit, self._speed_limit_final_last
+    elif self._ahead_limit > 0.:
+      # the easing steps the set speed down to the limit ahead (plus the offset) by the sign
+      kind, limit, target = MessageKind.lowerAhead, self._ahead_limit, self._ahead_limit + offset
+    else:
+      kind, limit, target = MessageKind.sign, limit_here, self._speed_limit_final_last
+
+    target_conv = round(target * speed_conv)
+    set_valid = 0. < self.v_cruise_cluster < V_CRUISE_VALID_MAX
+    direction = 0
+    if target < self.v_ego - SLOWING_MARGIN and (not set_valid or target_conv < self.v_cruise_cluster_conv):
+      direction = -1
+    elif target > self.v_ego + SLOWING_MARGIN and set_valid and target_conv > self.v_cruise_cluster_conv:
+      direction = 1
+    return SpeedLimitMessage(kind, limit, target, direction, silent)
+
+  def _announce(self, events_sp: EventsSP, message: SpeedLimitMessage, now: float) -> None:
+    self._deferred = None
+    if now - self._message_time < ANNOUNCE_REPLACE_TIME:
+      message.silent = True
+    self.message = message
+    self._message_time = now
     self._last_announced = (self.speed_limit_final_last_conv, now)
     if self.v_cruise_cluster_below_confirm_speed_threshold:
       events_sp.add(EventNameSP.speedLimitChanged)
@@ -420,6 +490,16 @@ class SpeedLimitAssist:
     if self.state == SpeedLimitAssistState.pending and self._state_prev != SpeedLimitAssistState.pending:
       events_sp.add(EventNameSP.speedLimitPending)
 
+    if not self.is_active:
+      self._deferred = None
+    elif self._deferred is not None:
+      # Fork (v34): the easing's pop-up waiting for the car to start slowing
+      now = time.monotonic()
+      if self._ahead_limit <= 0. or self._raise_step:
+        self._deferred = None  # the easing ended (the camera read the sign, or let go) before it slowed the car
+      elif self._speed_limit_final_last <= self.v_ego + SLOWING_MARGIN or now - self._deferred > ANNOUNCE_DEFER_MAX:
+        self._announce(events_sp, self._compose_message(), now)
+
     if self.is_active:
       if self._state_prev not in ACTIVE_STATES:
         self.update_active_event(events_sp, reactivation=not self.speed_limit_changed)
@@ -431,6 +511,11 @@ class SpeedLimitAssist:
       elif self._speed_limit != self.speed_limit_prev and self._sign_expected:
         # counts as announced (the easing / early step said it), so a cruise resume soon after doesn't repeat it
         self._last_announced = (self.speed_limit_final_last_conv, time.monotonic())
+        self._deferred = None
+        # Fork (v34): the early step went part of the way (55 -> 70: to 65); the sign takes the set speed the rest.
+        # Shown, but without a chime: the earlier pop-up already said this limit was coming.
+        if self.speed_limit_final_last_conv > self.v_cruise_cluster_conv and self._speed_limit_final_last > self.v_ego + SLOWING_MARGIN:
+          self._announce(events_sp, self._compose_message(silent=True), time.monotonic())
       elif self._speed_limit != self.speed_limit_prev and not quiet:
         if self.speed_limit_prev <= 0:
           self.update_active_event(events_sp)
@@ -440,11 +525,12 @@ class SpeedLimitAssist:
   def update(self, long_enabled: bool, long_override: bool, v_ego: float, a_ego: float, v_cruise_cluster: float, speed_limit: float,
              speed_limit_final_last: float, has_speed_limit: bool, distance: float, events_sp: EventsSP,
              quiet_change: bool = False, map_agrees: bool = False, map_conflict: bool = False, sign_prev: float = 0.,
-             raise_step: bool = False, sign_expected: bool = False) -> None:
+             raise_step: bool = False, sign_expected: bool = False, ahead_limit: float = 0.) -> None:
     self.long_enabled = long_enabled
     self._quiet_change = quiet_change
     self._raise_step = raise_step
     self._sign_expected = sign_expected
+    self._ahead_limit = ahead_limit
     self._map_agrees = map_agrees
     self._map_conflict = map_conflict
     self._sign_prev = sign_prev
@@ -453,6 +539,8 @@ class SpeedLimitAssist:
 
     self._has_speed_limit = has_speed_limit
     self._speed_limit = speed_limit
+    if speed_limit > 0.:
+      self._limit_last = speed_limit
     self._speed_limit_final_last = speed_limit_final_last
     self._distance = distance
 

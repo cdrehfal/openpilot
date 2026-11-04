@@ -110,6 +110,7 @@ class SpeedLimitResolver:
     self.easing_step = False  # this frame's change is a step of the map easing (not a new sign)
     self.raising = False  # the target is the early step toward a higher limit ahead (not a sign)
     self.sign_expected = False  # the camera read the limit the easing / early step was heading for
+    self.ahead_limit = 0.  # m/s: the limit ahead the easing or the early step is heading for, 0 when neither
     self._expected: tuple[float, float] | None = None  # (that limit, time the anticipation ended)
     self._odometer = 0.
     self._last_update_t: float | None = None
@@ -268,15 +269,18 @@ class SpeedLimitResolver:
     distance = self.distance_solutions[source] if source else 0.
 
     eased = raising = False
+    ahead_limit = 0.
     if source == SpeedLimitSource.car:
       anticipated, dist_ahead = self._anticipate_lower_limit_ahead(sm, speed_limit)
       if 0. < anticipated < speed_limit:
         speed_limit, distance, source, eased = anticipated, dist_ahead, SpeedLimitSource.map, True
+        ahead_limit = self._ease[0] if self._ease is not None else 0.
         self._raise = None
       else:
         raised, dist_ahead = self._anticipate_higher_limit_ahead(sm, speed_limit)
         if raised > speed_limit:
           speed_limit, distance, source, eased = raised, dist_ahead, SpeedLimitSource.map, True
+          ahead_limit = self._raise[0] if self._raise is not None else 0.
           raising = True
     else:
       self._ease = None
@@ -285,6 +289,7 @@ class SpeedLimitResolver:
       self._ease_floor = None
     self.easing_step = eased and self.source == SpeedLimitSource.map  # a continuing easing, not its first step
     self.raising = raising
+    self.ahead_limit = float(ahead_limit)
     self.sign_expected = (source == SpeedLimitSource.car and self._expected is not None
                           and abs(speed_limit - self._expected[0]) <= ANTICIPATE_AGREE_TOL
                           and time.monotonic() - self._expected[1] <= EXPECTED_SIGN_TIME)

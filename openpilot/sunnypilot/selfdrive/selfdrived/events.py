@@ -30,7 +30,7 @@ IS_MICI = HARDWARE.get_device_type() == 'mici'
 def speed_limit_adjust_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
   speedLimit = sm['longitudinalPlanSP'].speedLimit.resolver.speedLimit
   speed = round(speedLimit * (CV.MS_TO_KPH if metric else CV.MS_TO_MPH))
-  message = f'Adjusting to {speed} {"km/h" if metric else "mph"} speed limit'
+  message = f'Limit {speed}'  # Fork (v34): short enough for the big font
   return Alert(
     message,
     "",
@@ -39,6 +39,7 @@ def speed_limit_adjust_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.
 
 
 SpeedLimitSourceSP = custom.LongitudinalPlanSP.SpeedLimit.Source
+MessageKindSP = custom.LongitudinalPlanSP.SpeedLimit.MessageKind
 
 
 def _speed_limit_facts(sm: messaging.SubMaster, metric: bool) -> dict:
@@ -61,17 +62,35 @@ def _speed_limit_facts(sm: messaging.SubMaster, metric: bool) -> dict:
 
 def speed_limit_applied_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int,
                               personality) -> Alert:
-  """Fork: say what was applied: 'Speed limit 55 / set to 60', for the map easing 'Slowing for 45 / limit ahead', and
-  for the early step toward a higher limit '55 ahead / set to 55'."""
-  f = _speed_limit_facts(sm, metric)
-  if f['easing'] and f['ahead'] and f['ahead'] > f['limit']:
-    text1, text2 = f"{f['ahead']} ahead", f"set to {f['final']}"
-  elif f['easing'] and f['ahead']:
-    text1, text2 = f"Slowing for {f['ahead']}", "limit ahead"
+  """Fork (v34): short, and it says which way the car goes: 'Limit 45 / slowing to 50', 'Limit 55 / speeding up to 60',
+  '25 ahead / slowing to 30' (the map easing), '55 ahead / speeding up to 60' (the early step), 'Limit 55 / set to 60'
+  when the set speed changes but the car's speed won't (already below it), 'Limit 55' alone when nothing changes.
+  Speed Limit Assist decides all of it (speedLimit.assist.message); the UI only words it."""
+  conv = CV.MS_TO_KPH if metric else CV.MS_TO_MPH
+  m = sm['longitudinalPlanSP'].speedLimit.assist.message
+  if m.kind == MessageKindSP.none:  # not from this fork's planner: say what is known
+    f = _speed_limit_facts(sm, metric)
+    kind, limit, target, direction, silent = MessageKindSP.sign, f['limit'], f['final'], 0, False
   else:
-    text1, text2 = f"Speed limit {f['limit']}", f"set to {f['final']}"
-  return Alert(text1, text2, AlertStatus.normal, AlertSize.mid,
-               Priority.LOW, VisualAlert.none, AudibleAlertSP.promptSingleHigh, 5.)
+    kind, limit, target, direction, silent = m.kind, round(m.limit * conv), round(m.target * conv), m.direction, m.silent
+
+  set_now = round(CS.vCruiseCluster * (1. if metric else CV.KPH_TO_MPH)) if 0. < CS.vCruiseCluster < 250. else 0
+  text1 = f"{limit} ahead" if kind in (MessageKindSP.lowerAhead, MessageKindSP.higherAhead) else f"Limit {limit}"
+  if direction < 0:
+    text2 = f"slowing to {target}"
+  elif direction > 0:
+    # the early step toward a higher limit ahead goes only part of the way (55 -> 70: to 65, then 75 at the sign):
+    # no number that looks like a mistake next to '70 ahead'
+    offset = round(sm['longitudinalPlanSP'].speedLimit.resolver.speedLimitOffset * conv)
+    partial = kind == MessageKindSP.higherAhead and target < limit + offset
+    text2 = "speeding up" if partial else f"speeding up to {target}"
+  elif target != set_now:
+    text2 = f"set to {target}"
+  else:
+    text2 = ""
+  sound = AudibleAlert.none if silent else AudibleAlertSP.promptSingleHigh
+  return Alert(text1, text2, AlertStatus.normal, AlertSize.mid if text2 else AlertSize.small,
+               Priority.LOW, VisualAlert.none, sound, 5.)
 
 
 def speed_limit_pre_active_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
@@ -96,13 +115,13 @@ def speed_limit_pre_active_alert(CP: car.CarParams, CS: car.CarState, sm: messag
 
     alert_1_str = f"Speed Limit Assist: set to {pcm_long_required_max_set_speed_conv} {speed_unit} to engage"
   else:
-    # Fork: 'Speed limit 35? / tap - to set 40' (the question mark is the hint that it isn't sure)
+    # Fork: 'Limit 35? / tap - for 40' (the question mark is the hint that it isn't sure)
     f = _speed_limit_facts(sm, metric)
     alert_2_str = ""
     if set_speed_conv != speed_limit_final_last_conv:
       tap = "+" if set_speed_conv < speed_limit_final_last_conv else "-"
-      alert_1_str = f"Speed limit {f['limit']}?"
-      alert_2_str = f"tap {tap} to set {speed_limit_final_last_conv}"
+      alert_1_str = f"Limit {f['limit']}?"
+      alert_2_str = f"tap {tap} for {speed_limit_final_last_conv}"
     alert_size = AlertSize.mid if alert_1_str else AlertSize.none
     return Alert(
       alert_1_str,
@@ -144,16 +163,16 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
 
   EventNameSP.manualSteeringRequired: {
     ET.USER_DISABLE: Alert(
-      "Automatic Lane Centering is OFF",
-      "Manual Steering Required",
+      "Steering off",
+      "you steer",
       AlertStatus.normal, AlertSize.mid,
       Priority.LOW, VisualAlert.none, AudibleAlert.disengage, 1.),
   },
 
   EventNameSP.manualLongitudinalRequired: {
     ET.WARNING: Alert(
-      "Smart/Adaptive Cruise Control: OFF",
-      "Manual Speed Control Required",
+      "Cruise off",
+      "you control speed",
       AlertStatus.normal, AlertSize.mid,
       Priority.LOW, VisualAlert.none, AudibleAlert.none, 1.),
   },
@@ -178,9 +197,9 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
       AlertStatus.normal, AlertSize.none,
       Priority.LOWEST, VisualAlert.none, AudibleAlert.none, 0.),
     ET.NO_ENTRY: Alert(
-      "Gear not D",
-      "openpilot Unavailable",
-      AlertStatus.normal, AlertSize.mid,
+      "Shift to D",
+      "",
+      AlertStatus.normal, AlertSize.small,
       Priority.LOW, VisualAlert.none, AudibleAlert.none, 0.),
   },
 
@@ -267,7 +286,7 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
 
   EventNameSP.speedLimitPending: {
     ET.WARNING: Alert(
-      "Auto adjusting to last speed limit",
+      "Using last limit",
       "",
       AlertStatus.normal, AlertSize.small,
       Priority.LOW, VisualAlert.none, AudibleAlertSP.promptSingleHigh, 5.),
@@ -283,23 +302,23 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
 
   EventNameSP.laneChangeRoadEdge: {
     ET.WARNING: Alert(
-      "Lane Change Unavailable: Road Edge",
-      "",
-      AlertStatus.userPrompt, AlertSize.small,
+      "No lane change",
+      "road edge",
+      AlertStatus.userPrompt, AlertSize.mid,
       Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 0.1),
   },
 
   EventNameSP.laneChangeOff: {
     ET.PERMANENT: Alert(
-      "Lane Changes Off",
-      "Hold the LKA button again to turn them back on",
+      "Lane changes off",
+      "hold LKA to undo",
       AlertStatus.normal, AlertSize.mid,
       Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 2.5),
   },
 
   EventNameSP.laneChangeOn: {
     ET.PERMANENT: Alert(
-      "Lane Changes On",
+      "Lane changes on",
       "",
       AlertStatus.normal, AlertSize.small,
       Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 2.5),

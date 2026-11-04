@@ -11,6 +11,7 @@ from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.common.filter_simple import BounceFilter, FirstOrderFilter
 from openpilot.common.hardware import COMMA_HARDWARE
 from openpilot.system.ui.lib.application import gui_app, FontWeight, TextAlignment
+from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.widgets.label import UnifiedLabel
 
@@ -37,6 +38,26 @@ ALERT_COLORS = {
 TURN_SIGNAL_BLINK_PERIOD = 1 / (80 / 60)  # Mazda heartbeat turn signal BPM
 
 DEBUG = False
+
+# Fork (v34): each line gets the largest size that fits on one line (was chosen by character count, so short lines
+# could be smaller than needed and long ones wrapped into a block); the second line is semi-bold and near full white
+# (was regular at 65%, hard to read over a bright sky), and the dark band behind the text reaches further down.
+TEXT1_SIZES = (82, 72, 62, 54)
+TEXT2_SIZES = (52, 46, 40, 36)
+TEXT1_LETTER_SPACING = -0.02
+TEXT2_LETTER_SPACING = 0.01
+TEXT2_ALPHA = 0.95
+SOLID_FRACTION_WITH_TEXT2 = 0.45
+
+
+def fit_font_size(font_weight: FontWeight, text: str, sizes: tuple[int, ...], width: float, letter_spacing: float) -> int:
+  """The largest of sizes at which every line of text fits in width; the smallest when none does (it then wraps)."""
+  font = gui_app.font(font_weight)
+  lines = text.split('\n')
+  for size in sizes:
+    if all(measure_text_cached(font, line, size, size * letter_spacing).x <= width for line in lines):
+      return size
+  return sizes[-1]
 
 
 class IconSide(StrEnum):
@@ -97,8 +118,8 @@ class AlertRenderer(Widget, SpeedLimitAlertRenderer):
 
     self._alert_text1_label = UnifiedLabel(text="", font_size=ALERT_FONT_BIG, font_weight=FontWeight.DISPLAY, line_height=0.86,
                                            letter_spacing=-0.02)
-    self._alert_text2_label = UnifiedLabel(text="", font_size=ALERT_FONT_SMALL, font_weight=FontWeight.ROMAN, line_height=0.86,
-                                           letter_spacing=0.025)
+    self._alert_text2_label = UnifiedLabel(text="", font_size=ALERT_FONT_SMALL, font_weight=FontWeight.SEMI_BOLD, line_height=0.86,
+                                           letter_spacing=TEXT2_LETTER_SPACING)
 
     self._prev_alert: Alert | None = None
     self._text_gen_time = 0
@@ -299,7 +320,7 @@ class AlertRenderer(Widget, SpeedLimitAlertRenderer):
     else:
       bg_height = int(self._rect.height)
 
-    solid_height = round(bg_height * 0.2)
+    solid_height = round(bg_height * (SOLID_FRACTION_WITH_TEXT2 if alert.text2 else 0.2))
     rl.draw_rectangle(int(self._rect.x), int(self._rect.y), int(self._rect.width), solid_height, color)
     rl.draw_rectangle_gradient_v(int(self._rect.x), int(self._rect.y + solid_height), int(self._rect.width),
                                  int(bg_height - solid_height),
@@ -310,16 +331,8 @@ class AlertRenderer(Widget, SpeedLimitAlertRenderer):
 
     # TODO: hack
     alert_text1 = alert.text1.lower().replace('calibrating: ', 'calibrating:\n')
-    # TODO: there should be a common way to determine font size based on text length to maximize rect
-    if len(alert_text1) <= 12:
-      font_size = 92 - 10
-    elif len(alert_text1) <= 16:
-      font_size = 70
-    else:
-      font_size = 64 - 10
-
-    if icon_side is not None:
-      font_size -= 10
+    sizes1 = tuple(s - 10 for s in TEXT1_SIZES) if icon_side is not None else TEXT1_SIZES
+    font_size = fit_font_size(FontWeight.DISPLAY, alert_text1, sizes1, alert_layout.text_rect.width, TEXT1_LETTER_SPACING)
 
     color = rl.Color(255, 255, 255, int(255 * 0.9 * self._alpha_filter.x))
 
@@ -348,19 +361,14 @@ class AlertRenderer(Widget, SpeedLimitAlertRenderer):
     if alert_text2:
       last_line_h = self._alert_text1_label.rect.y + self._alert_text1_label.get_content_height(int(alert_layout.text_rect.width))
       last_line_h -= 4
-      if len(alert_text2) > 24:
-        small_font_size = 32
-      elif len(alert_text2) > 18:
-        small_font_size = 36
-      else:
-        small_font_size = 40
+      small_font_size = fit_font_size(FontWeight.SEMI_BOLD, alert_text2, TEXT2_SIZES, alert_layout.text_rect.width, TEXT2_LETTER_SPACING)
       text_rect2 = rl.Rectangle(
         alert_layout.text_rect.x,
         last_line_h,
         alert_layout.text_rect.width,
         alert_layout.text_rect.height - last_line_h
       )
-      color = rl.Color(255, 255, 255, int(255 * 0.65 * self._alpha_filter.x))
+      color = rl.Color(255, 255, 255, int(255 * TEXT2_ALPHA * self._alpha_filter.x))
 
       self._alert_text2_label.set_text(alert_text2)
       self._alert_text2_label.set_text_color(color)
